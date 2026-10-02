@@ -27,6 +27,185 @@ from reprlib import recursive_repr
 from textwrap import dedent
 
 
+_END = object()
+
+
+def _multiset_group(left, right, operation):
+    def add_count(buckets, order, value):
+        bucket = buckets.setdefault(hash(value), [])
+        for pos, (existing, _count) in enumerate(bucket):
+            if existing == value:
+                bucket[pos] = (value, _count + 1)
+                return
+
+        bucket.append((value, 1))
+        order.append(value)
+
+    def get_count(buckets, value):
+        bucket = buckets.get(hash(value))
+        if bucket is None:
+            return 0
+
+        for existing, count in bucket:
+            if existing == value:
+                return count
+
+        return 0
+
+    try:
+        if operation == 'sum':
+            for value in left:
+                yield value
+            for value in right:
+                yield value
+            return
+
+        left_counts = {}
+        left_order = []
+        right_counts = {}
+        right_order = []
+
+        for value in left:
+            add_count(left_counts, left_order, value)
+
+        for value in right:
+            add_count(right_counts, right_order, value)
+    except TypeError:
+        used = [False] * len(right)
+        matched = []
+        unmatched_left = []
+
+        for value in left:
+            found = False
+            for pos, other in enumerate(right):
+                if not used[pos] and other == value:
+                    used[pos] = True
+                    matched.append(value)
+                    found = True
+                    break
+
+            if not found:
+                unmatched_left.append(value)
+
+        unmatched_right = [
+            value for pos, value in enumerate(right) if not used[pos]
+        ]
+
+        if operation == 'intersection':
+            values = matched
+        elif operation == 'difference':
+            values = unmatched_left
+        elif operation == 'symmetric_difference':
+            values = unmatched_left + unmatched_right
+        elif operation == 'sum':
+            values = left + right
+        else:
+            values = left + unmatched_right
+
+        for value in values:
+            yield value
+
+        return
+
+    if operation == 'intersection':
+        for value in left_order:
+            count = min(get_count(left_counts, value), get_count(right_counts, value))
+            for _ in range(count):
+                yield value
+        return
+
+    if operation == 'difference':
+        for value in left_order:
+            count = get_count(left_counts, value) - get_count(right_counts, value)
+            for _ in range(max(count, 0)):
+                yield value
+        return
+
+    if operation == 'symmetric_difference':
+        for value in left_order:
+            count = get_count(left_counts, value) - get_count(right_counts, value)
+            for _ in range(max(count, 0)):
+                yield value
+        for value in right_order:
+            count = get_count(right_counts, value) - get_count(left_counts, value)
+            for _ in range(max(count, 0)):
+                yield value
+        return
+
+    for value in left_order:
+        count = max(get_count(left_counts, value), get_count(right_counts, value))
+        for _ in range(count):
+            yield value
+
+    for value in right_order:
+        count = (
+            get_count(right_counts, value)
+            if get_count(left_counts, value) == 0
+            else 0
+        )
+        for _ in range(count):
+            yield value
+
+    return
+
+
+def _multiset_merge(left, right, operation):
+    left_only = ('union', 'sum', 'difference', 'symmetric_difference')
+    right_key_only = ('union', 'sum', 'symmetric_difference')
+    left = iter(left)
+    right = iter(right)
+    left_item = next(left, _END)
+    right_item = next(right, _END)
+
+    def next_group(items, iterator):
+        if items is _END:
+            return _END, [], _END
+
+        key, first_value = items
+        group = [first_value]
+        items = next(iterator, _END)
+
+        while items is not _END and items[0] == key:
+            group.append(items[1])
+            items = next(iterator, _END)
+
+        return key, group, items
+
+    left_key, left_group, left_item = next_group(left_item, left)
+    right_key, right_group, right_item = next_group(right_item, right)
+
+    while left_key is not _END or right_key is not _END:
+        if right_key is _END:
+            if operation in left_only:
+                for value in left_group:
+                    yield value
+            left_key, left_group, left_item = next_group(left_item, left)
+        elif left_key is _END:
+            if operation in right_key_only:
+                for value in right_group:
+                    yield value
+            right_key, right_group, right_item = next_group(right_item, right)
+        elif left_key == right_key:
+            for value in _multiset_group(left_group, right_group, operation):
+                yield value
+            left_key, left_group, left_item = next_group(left_item, left)
+            right_key, right_group, right_item = next_group(
+                right_item, right
+            )
+        elif left_key < right_key:
+            if operation in left_only:
+                for value in left_group:
+                    yield value
+            left_key, left_group, left_item = next_group(left_item, left)
+        else:
+            if operation in right_key_only:
+                for value in right_group:
+                    yield value
+            right_key, right_group, right_item = next_group(
+                right_item, right
+            )
+
+
 class SortedList(MutableSequence):
     """Sorted list is a sorted mutable sequence.
 
@@ -71,6 +250,11 @@ class SortedList(MutableSequence):
     Methods for miscellany:
 
     * :func:`SortedList.copy`
+    * :func:`SortedList.multiset_intersection`
+    * :func:`SortedList.multiset_union`
+    * :func:`SortedList.multiset_sum`
+    * :func:`SortedList.multiset_difference`
+    * :func:`SortedList.multiset_symmetric_difference`
     * :func:`SortedList.__len__`
     * :func:`SortedList.__repr__`
     * :func:`SortedList._check`
@@ -1198,6 +1382,113 @@ class SortedList(MutableSequence):
 
     __copy__ = copy
 
+    def _multiset_items(self):
+        return ((value, value) for value in chain.from_iterable(self._lists))
+
+    def _multiset_result(self, values):
+        result = object.__new__(type(self))
+        result._len = 0
+        result._load = self._load
+        result._lists = []
+        result._maxes = []
+        result._index = []
+        result._offset = 0
+
+        load = self._load
+        result._lists = [
+            values[pos : (pos + load)]
+            for pos in range(0, len(values), load)
+        ]
+        result._maxes = [sublist[-1] for sublist in result._lists]
+        result._len = len(values)
+        return result
+
+    def _multiset(self, other, operation):
+        if not isinstance(other, SortedList):
+            raise TypeError('multiset operation requires a SortedList')
+
+        if self.key is not other.key:
+            raise TypeError('incompatible key functions')
+
+        values = list(
+            _multiset_merge(
+                self._multiset_items(), other._multiset_items(), operation
+            )
+        )
+        return self._multiset_result(values)
+
+    def multiset_intersection(self, other):
+        """Return the multiplicity-preserving intersection.
+
+        Equal values appear ``min(count(self), count(other))`` times.
+
+        Runtime complexity: `O(n)`
+
+        :param other: other sorted list
+        :return: new sorted list
+        :raises TypeError: if `other` is not a sorted list or has a different key
+
+        """
+        return self._multiset(other, 'intersection')
+
+    def multiset_union(self, other):
+        """Return the multiset union using the maximum multiplicity.
+
+        Equal values appear ``max(count(self), count(other))`` times. Use
+        :func:`SortedList.multiset_sum` for addition of multiplicities.
+
+        Runtime complexity: `O(n)`
+
+        :param other: other sorted list
+        :return: new sorted list
+        :raises TypeError: if `other` is not a sorted list or has a different key
+
+        """
+        return self._multiset(other, 'union')
+
+    def multiset_sum(self, other):
+        """Return the multiset sum, adding multiplicities.
+
+        Equal values appear ``count(self) + count(other)`` times. This differs
+        from :func:`SortedList.multiset_union`, which uses the maximum count.
+
+        Runtime complexity: `O(n)`
+
+        :param other: other sorted list
+        :return: new sorted list
+        :raises TypeError: if `other` is not a sorted list or has a different key
+
+        """
+        return self._multiset(other, 'sum')
+
+    def multiset_difference(self, other):
+        """Return the multiplicity-preserving difference.
+
+        Equal values appear ``max(count(self) - count(other), 0)`` times.
+
+        Runtime complexity: `O(n)`
+
+        :param other: other sorted list
+        :return: new sorted list
+        :raises TypeError: if `other` is not a sorted list or has a different key
+
+        """
+        return self._multiset(other, 'difference')
+
+    def multiset_symmetric_difference(self, other):
+        """Return the multiplicity-preserving symmetric difference.
+
+        Equal values appear ``abs(count(self) - count(other))`` times.
+
+        Runtime complexity: `O(n)`
+
+        :param other: other sorted list
+        :return: new sorted list
+        :raises TypeError: if `other` is not a sorted list or has a different key
+
+        """
+        return self._multiset(other, 'symmetric_difference')
+
     def append(self, value):
         """Raise not-implemented error.
 
@@ -1596,6 +1887,10 @@ class SortedKeyList(SortedList):
 
     The sorted-key list maintains values in comparison order based on the
     result of a key function applied to every value.
+
+    Inherited multiset operations require the same key function. Values with
+    equal keys are matched as multiset elements by value equality, not merely
+    by their key.
 
     All the same methods that are available in :class:`SortedList` are also
     available in :class:`SortedKeyList`.
@@ -2298,6 +2593,37 @@ class SortedKeyList(SortedList):
         return self.__class__(self, key=self._key)
 
     __copy__ = copy
+
+    def _multiset_items(self):
+        return (
+            (key, value)
+            for subkeys, subvalues in zip(self._keys, self._lists)
+            for key, value in zip(subkeys, subvalues)
+        )
+
+    def _multiset_result(self, values):
+        result = object.__new__(type(self))
+        result._key = self._key
+        result._len = 0
+        result._load = self._load
+        result._lists = []
+        result._keys = []
+        result._maxes = []
+        result._index = []
+        result._offset = 0
+
+        load = self._load
+        result._lists = [
+            values[pos : (pos + load)]
+            for pos in range(0, len(values), load)
+        ]
+        result._keys = [
+            [self._key(value) for value in sublist]
+            for sublist in result._lists
+        ]
+        result._maxes = [keys[-1] for keys in result._keys]
+        result._len = len(values)
+        return result
 
     def index(self, value, start=None, stop=None):
         """Return first index of value in sorted-key list.

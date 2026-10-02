@@ -37,6 +37,11 @@ SortedList
    .. automethod:: __gt__
    .. automethod:: __ge__
    .. automethod:: copy
+   .. automethod:: multiset_intersection
+   .. automethod:: multiset_union
+   .. automethod:: multiset_sum
+   .. automethod:: multiset_difference
+   .. automethod:: multiset_symmetric_difference
    .. automethod:: __len__
    .. automethod:: __repr__
    .. automethod:: _check

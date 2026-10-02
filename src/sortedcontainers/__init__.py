@@ -53,6 +53,7 @@ from .sorteddict import (
 )
 from .sortedlist import SortedKeyList, SortedList, SortedListWithKey
 from .sortedset import SortedSet
+from .priorityqueue import PriorityQueue
 
 __all__ = [
     'SortedList',
@@ -63,6 +64,7 @@ __all__ = [
     'SortedItemsView',
     'SortedValuesView',
     'SortedSet',
+    'PriorityQueue',
 ]
 
 __title__ = 'sortedcontainers'

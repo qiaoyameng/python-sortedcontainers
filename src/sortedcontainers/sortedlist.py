@@ -86,7 +86,7 @@ class SortedList(MutableSequence):
 
     DEFAULT_LOAD_FACTOR = 1000
 
-    def __init__(self, iterable=None, key=None):
+    def __init__(self, iterable=None, key=None, managed=False, manage=None):
         """Initialize sorted list instance.
 
         Optional `iterable` argument provides an initial iterable of values to
@@ -102,9 +102,14 @@ class SortedList(MutableSequence):
         SortedList([1, 2, 3, 4, 5])
 
         :param iterable: initial values (optional)
+        :param managed: requires a key function (optional)
 
         """
         assert key is None
+        managed = managed if manage is None else manage
+
+        if managed:
+            raise TypeError('managed members require a key function')
         self._len = 0
         self._load = self.DEFAULT_LOAD_FACTOR
         self._lists = []
@@ -115,7 +120,7 @@ class SortedList(MutableSequence):
         if iterable is not None:
             self._update(iterable)
 
-    def __new__(cls, iterable=None, key=None):
+    def __new__(cls, iterable=None, key=None, managed=False, manage=None):
         """Create new sorted list or sorted-key list instance.
 
         Optional `key`-function argument will return an instance of subtype
@@ -132,10 +137,15 @@ class SortedList(MutableSequence):
 
         :param iterable: initial values (optional)
         :param key: function used to extract comparison key (optional)
+        :param managed: opt in to identity-tracked key-list members
         :return: sorted list or sorted-key list instance
 
         """
         # pylint: disable=unused-argument
+        managed = managed if manage is None else manage
+
+        if managed and key is None:
+            raise TypeError('managed members require a key function')
         if key is None:
             return object.__new__(cls)
         else:
@@ -1591,6 +1601,9 @@ def identity(value):
     return value
 
 
+_MANAGED_KEY_MISSING = object()
+
+
 class SortedKeyList(SortedList):
     """Sorted-key list is a subtype of sorted list.
 
@@ -1603,9 +1616,11 @@ class SortedKeyList(SortedList):
     Additional methods provided:
 
     * :attr:`SortedKeyList.key`
+    * :attr:`SortedKeyList.managed`
     * :func:`SortedKeyList.bisect_key_left`
     * :func:`SortedKeyList.bisect_key_right`
     * :func:`SortedKeyList.irange_key`
+    * :func:`SortedKeyList.refresh`
 
     Some examples below use:
 
@@ -1617,7 +1632,7 @@ class SortedKeyList(SortedList):
 
     """
 
-    def __init__(self, iterable=None, key=identity):
+    def __init__(self, iterable=None, key=identity, managed=False, manage=None):
         """Initialize sorted-key list instance.
 
         Optional `iterable` argument provides an initial iterable of values to
@@ -1626,6 +1641,10 @@ class SortedKeyList(SortedList):
         Optional `key` argument defines a callable that, like the `key`
         argument to Python's `sorted` function, extracts a comparison key from
         each value. The default is the identity function.
+
+        When ``managed`` is true, members are tracked by identity and
+        :func:`refresh` can move a member after its key changes. The keyword
+        ``manage`` is accepted as an alias.
 
         Runtime complexity: `O(n*log(n))`
 
@@ -1639,13 +1658,18 @@ class SortedKeyList(SortedList):
 
         :param iterable: initial values (optional)
         :param key: function used to extract comparison key (optional)
+        :param managed: opt in to identity-tracked members (optional)
 
         """
         self._key = key
+        managed = managed if manage is None else manage
+        self._managed = bool(managed)
         self._len = 0
         self._load = self.DEFAULT_LOAD_FACTOR
         self._lists = []
         self._keys = []
+        self._member_counts = {}
+        self._member_keys = {}
         self._maxes = []
         self._index = []
         self._offset = 0
@@ -1653,13 +1677,21 @@ class SortedKeyList(SortedList):
         if iterable is not None:
             self._update(iterable)
 
-    def __new__(cls, iterable=None, key=identity):
+    def __new__(cls, iterable=None, key=identity, managed=False, manage=None):
+        # pylint: disable=unused-argument
         return object.__new__(cls)
 
     @property
     def key(self):
         "Function used to extract comparison key from values."
         return self._key
+
+    @property
+    def managed(self):
+        "True when members are tracked by identity."
+        return self._managed
+
+    manage = managed
 
     def clear(self):
         """Remove all values from sorted-key list.
@@ -1672,6 +1704,8 @@ class SortedKeyList(SortedList):
         del self._keys[:]
         del self._maxes[:]
         del self._index[:]
+        self._member_counts.clear()
+        self._member_keys.clear()
 
     _clear = clear
 
@@ -1691,13 +1725,37 @@ class SortedKeyList(SortedList):
         :param value: value to add to sorted-key list
 
         """
+        key = self._key(value)
+
+        if self._managed:
+            member_id = id(value)
+            old_key = self._member_keys.get(
+                member_id, _MANAGED_KEY_MISSING
+            )
+
+            if old_key is not _MANAGED_KEY_MISSING and old_key != key:
+                raise ValueError('member key changed before refresh')
+
+        pos = self._add(value, key)
+
+        if self._managed:
+            count = self._member_counts.get(member_id, 0)
+            self._member_counts[member_id] = count + 1
+            if count == 0:
+                self._member_keys[member_id] = key
+
+    def _add(self, value, key):
+        """Add a member whose key has already been computed."""
         _lists = self._lists
         _keys = self._keys
         _maxes = self._maxes
 
-        key = self._key(value)
-
-        if _maxes:
+        if not _maxes:
+            _lists.append([value])
+            _keys.append([key])
+            _maxes.append(key)
+            pos = 0
+        else:
             pos = bisect_right(_maxes, key)
 
             if pos == len(_maxes):
@@ -1710,13 +1768,10 @@ class SortedKeyList(SortedList):
                 _lists[pos].insert(idx, value)
                 _keys[pos].insert(idx, key)
 
-            self._expand(pos)
-        else:
-            _lists.append([value])
-            _keys.append([key])
-            _maxes.append(key)
+        pos = self._expand(pos)
 
         self._len += 1
+        return pos
 
     def _expand(self, pos):
         """Split sublists with length greater than double the load-factor.
@@ -1748,6 +1803,7 @@ class SortedKeyList(SortedList):
             _maxes.insert(pos + 1, half_keys[-1])
 
             del _index[:]
+            return pos + 1
         else:
             if _index:
                 child = self._offset + pos
@@ -1755,6 +1811,7 @@ class SortedKeyList(SortedList):
                     _index[child] += 1
                     child = (child - 1) >> 1
                 _index[0] += 1
+            return pos
 
     def update(self, iterable):
         """Update sorted-key list by adding all values from `iterable`.
@@ -1770,31 +1827,67 @@ class SortedKeyList(SortedList):
         :param iterable: iterable of values to add
 
         """
+        incoming = list(iterable)
+        pairs = sorted(
+            ((self._key(value), value) for value in incoming),
+            key=lambda pair: pair[0],
+        )
+
+        if self._managed:
+            for key, value in pairs:
+                member_id = id(value)
+                old_key = self._member_keys.get(
+                    member_id, _MANAGED_KEY_MISSING
+                )
+                if old_key is not _MANAGED_KEY_MISSING and old_key != key:
+                    raise ValueError('member key changed before refresh')
+
         _lists = self._lists
         _keys = self._keys
         _maxes = self._maxes
-        values = sorted(iterable, key=self._key)
 
-        if _maxes:
-            if len(values) * 4 >= self._len:
-                _lists.append(values)
-                values = reduce(iadd, _lists, [])
-                values.sort(key=self._key)
-                self._clear()
-            else:
-                _add = self.add
-                for val in values:
-                    _add(val)
-                return
+        if _maxes and len(pairs) * 4 >= self._len:
+            existing = [
+                (key, value)
+                for values, keys in zip(_lists, _keys)
+                for value, key in zip(values, keys)
+            ]
+            pairs = sorted(existing + pairs, key=lambda pair: pair[0])
+            self._clear()
+        elif _maxes:
+            for key, value in pairs:
+                self._add(value, key)
+                if self._managed:
+                    member_id = id(value)
+                    count = self._member_counts.get(member_id, 0)
+                    self._member_counts[member_id] = count + 1
+                    if count == 0:
+                        self._member_keys[member_id] = key
+            return
 
         _load = self._load
         _lists.extend(
-            values[pos : (pos + _load)] for pos in range(0, len(values), _load)
+            [value for key, value in pairs[pos : (pos + _load)]]
+            for pos in range(0, len(pairs), _load)
         )
-        _keys.extend(list(map(self._key, _list)) for _list in _lists)
+        _keys.extend(
+            [key for key, value in chunk]
+            for chunk in (
+                pairs[pos : (pos + _load)] for pos in range(0, len(pairs), _load)
+            )
+        )
         _maxes.extend(sublist[-1] for sublist in _keys)
-        self._len = len(values)
+        self._len = len(pairs)
         del self._index[:]
+
+        if self._managed:
+            for values, keys in zip(_lists, _keys):
+                for value, key in zip(values, keys):
+                    member_id = id(value)
+                    count = self._member_counts.get(member_id, 0)
+                    self._member_counts[member_id] = count + 1
+                    if count == 0:
+                        self._member_keys[member_id] = key
 
     _update = update
 
@@ -1966,6 +2059,7 @@ class SortedKeyList(SortedList):
         _index = self._index
         keys_pos = _keys[pos]
         lists_pos = _lists[pos]
+        value = lists_pos[idx]
 
         del keys_pos[idx]
         del lists_pos[idx]
@@ -2004,6 +2098,106 @@ class SortedKeyList(SortedList):
             del _keys[pos]
             del _maxes[pos]
             del _index[:]
+
+        if self._managed:
+            member_id = id(value)
+            count = self._member_counts[member_id] - 1
+            if count:
+                self._member_counts[member_id] = count
+            else:
+                del self._member_counts[member_id]
+                del self._member_keys[member_id]
+
+    def _insert(self, index, value, key):
+        """Insert a cached value-key pair at a global position."""
+        if not self._maxes:
+            self._lists.append([value])
+            self._keys.append([key])
+            self._maxes.append(key)
+            pos = 0
+        elif index == self._len:
+            pos = len(self._lists) - 1
+            self._lists[pos].append(value)
+            self._keys[pos].append(key)
+            self._maxes[pos] = key
+        else:
+            pos, idx = self._pos(index)
+            self._lists[pos].insert(idx, value)
+            self._keys[pos].insert(idx, key)
+
+        self._len += 1
+        return self._expand(pos)
+
+    def _identity_positions(self, member):
+        """Return positions of member using its identity and cached key."""
+        member_id = id(member)
+
+        try:
+            old_key = self._member_keys[member_id]
+            expected = self._member_counts[member_id]
+        except KeyError:
+            raise ValueError(f'{member!r} is not a managed member')
+
+        positions = []
+        _lists = self._lists
+        _keys = self._keys
+        pos = bisect_left(self._maxes, old_key)
+
+        while pos < len(_keys) and old_key <= _keys[pos][-1]:
+            idx = bisect_left(_keys[pos], old_key)
+
+            while idx < len(_keys[pos]) and _keys[pos][idx] == old_key:
+                if _lists[pos][idx] is member:
+                    positions.append(self._loc(pos, idx))
+                idx += 1
+
+            pos += 1
+
+        if len(positions) != expected:
+            raise RuntimeError('managed member index is inconsistent')
+
+        return positions, old_key
+
+    def refresh(self, member):
+        """Refresh every occurrence of a managed member after its key changes.
+
+        The member is located by identity using its cached key. Equal members with
+        different identities are not refreshed. Every occurrence of the same instance
+        moves together.
+
+        Runtime complexity is based on the number of occurrences and members
+        around the relevant key ranges, rather than resorting all members.
+
+        :param member: managed member whose key changed
+        :raises ValueError: if managed members are disabled or member is absent
+
+        """
+        if not self._managed:
+            raise ValueError('refresh requires managed members')
+
+        positions, old_key = self._identity_positions(member)
+        new_key = self._key(member)
+
+        if new_key == old_key:
+            return
+
+        insert_at = self._bisect_key_right(new_key)
+        insert_at -= sum(1 for position in positions if position < insert_at)
+
+        was_managed = self._managed
+        self._managed = False
+
+        try:
+            for position in reversed(positions):
+                pos, idx = self._pos(position)
+                self._delete(pos, idx)
+
+            for offset in range(len(positions)):
+                self._insert(insert_at + offset, member, new_key)
+        finally:
+            self._managed = was_managed
+
+        self._member_keys[id(member)] = new_key
 
     def irange(self, minimum=None, maximum=None, inclusive=(True, True), reverse=False):
         """Create an iterator of values between `minimum` and `maximum`.
@@ -2295,7 +2489,7 @@ class SortedKeyList(SortedList):
         :return: new sorted-key list
 
         """
-        return self.__class__(self, key=self._key)
+        return self.__class__(self, key=self._key, managed=self._managed)
 
     __copy__ = copy
 
@@ -2404,7 +2598,7 @@ class SortedKeyList(SortedList):
         """
         values = reduce(iadd, self._lists, [])
         values.extend(other)
-        return self.__class__(values, key=self._key)
+        return self.__class__(values, key=self._key, managed=self._managed)
 
     __radd__ = __add__
 
@@ -2425,11 +2619,11 @@ class SortedKeyList(SortedList):
 
         """
         values = reduce(iadd, self._lists, []) * num
-        return self.__class__(values, key=self._key)
+        return self.__class__(values, key=self._key, managed=self._managed)
 
     def __reduce__(self):
         values = reduce(iadd, self._lists, [])
-        return (type(self), (values, self.key))
+        return (type(self), (values, self.key, self._managed))
 
     @recursive_repr()
     def __repr__(self):
@@ -2441,6 +2635,8 @@ class SortedKeyList(SortedList):
 
         """
         type_name = type(self).__name__
+        if self._managed:
+            return f'{type_name}({list(self)!r}, key={self._key!r}, managed=True)'
         return f'{type_name}({list(self)!r}, key={self._key!r})'
 
     def _check(self):
@@ -2465,12 +2661,24 @@ class SortedKeyList(SortedList):
             for pos in range(1, len(self._keys)):
                 assert self._keys[pos - 1][-1] <= self._keys[pos][0]
 
-            # Check _keys matches _key mapped to _lists.
+            # Check _keys matches _key mapped to _lists. Managed lists must
+            # not call the key-function because refresh is explicitly deferred.
 
+            seen_counts = {}
+            seen_keys = {}
             for val_sublist, key_sublist in zip(self._lists, self._keys):
                 assert len(val_sublist) == len(key_sublist)
                 for val, key in zip(val_sublist, key_sublist):
-                    assert self._key(val) == key
+                    if self._managed:
+                        member_id = id(val)
+                        seen_counts[member_id] = seen_counts.get(member_id, 0) + 1
+                        seen_keys.setdefault(member_id, key)
+                    else:
+                        assert self._key(val) == key
+
+            if self._managed:
+                assert seen_counts == self._member_counts
+                assert seen_keys == self._member_keys
 
             # Check _maxes index is the last value of each sublist.
 

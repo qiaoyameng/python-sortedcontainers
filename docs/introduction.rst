@@ -503,6 +503,16 @@ its position in `sl`. To modify the sorted order position, :func:`remove
 <SortedList.remove>` the value, update it, and then :func:`add
 <SortedList.add>` the value back again.
 
+A :class:`SortedKeyList` can opt in to managed members with ``managed=True``
+when a key-function is supplied. Managed members are tracked by identity, so
+after changing an attribute that affects its key, call
+:func:`SortedKeyList.refresh` with the member. The refresh operation finds the
+member's old position through the cached key, then removes and reinserts only
+that member. Multiple occurrences of the same instance are refreshed together;
+equal members with different identities are treated as separate members. If the
+key-function or key comparison raises before insertion, the existing order is
+left untouched.
+
 Similar limitations also apply to Python's `dict` data type which can be
 corrupted by modifying the hash of a key while the item is stored in the
 `dict`. The hashing protocol also requires that equal keys have equal hashes.

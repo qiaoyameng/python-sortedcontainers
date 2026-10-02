@@ -56,8 +56,10 @@ SortedKeyList
 
    .. automethod:: __init__
    .. autoattribute:: key
+   .. autoattribute:: managed
    .. automethod:: bisect_key_left
    .. automethod:: bisect_key_right
    .. automethod:: irange_key
+   .. automethod:: refresh
 
 .. autoclass:: sortedcontainers.SortedListWithKey

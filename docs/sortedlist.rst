@@ -30,6 +30,8 @@ SortedList
    .. automethod:: __iadd__
    .. automethod:: __mul__
    .. automethod:: __imul__
+   .. automethod:: split
+   .. automethod:: concat
    .. automethod:: __eq__
    .. automethod:: __ne__
    .. automethod:: __lt__

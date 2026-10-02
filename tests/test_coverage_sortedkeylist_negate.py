@@ -1,5 +1,6 @@
 import random
-from sortedcontainers import SortedKeyList, SortedListWithKey
+from bisect import bisect_left, bisect_right
+from sortedcontainers import SortedKeyList, SortedList, SortedListWithKey
 from itertools import chain
 import pytest
 
@@ -678,3 +679,134 @@ def test_check():
     slt._len = 5
     with pytest.raises(AssertionError):
         slt._check()
+
+
+def test_split():
+    values = [val // 3 for val in range(30)]
+    skl = SortedKeyList(values, key=negate)
+    skl._reset(4)
+    assert len(skl._lists) > 2
+    source = list(skl)
+
+    for index in range(-35, 36):
+        left, right = skl.split(index)
+
+        # The original is not consumed.
+        assert list(skl) == source
+        skl._check()
+
+        assert isinstance(left, SortedKeyList)
+        assert isinstance(right, SortedKeyList)
+        assert left.key is negate
+        assert right.key is negate
+
+        cut = index + len(source) if index < 0 else index
+        cut = min(max(cut, 0), len(source))
+        assert len(left) == cut
+        assert len(right) == len(source) - cut
+
+        # Split is positional; duplicates keep their order on both sides.
+        assert list(left) == source[:cut]
+        assert list(right) == source[cut:]
+        left._check()
+        right._check()
+
+        # Results share no mutable sublists with the original or each other.
+        original_ids = set(map(id, skl._lists + skl._keys))
+        left_ids = set(map(id, left._lists + left._keys))
+        right_ids = set(map(id, right._lists + right._keys))
+        assert not original_ids & left_ids
+        assert not original_ids & right_ids
+        assert not left_ids & right_ids
+
+        # Positional indexing and key-bisect work on both parts.
+        for pos, value in enumerate(source[:cut]):
+            assert left[pos] == value
+        for pos, value in enumerate(source[cut:]):
+            assert right[pos] == value
+        left_keys = list(map(negate, source[:cut]))
+        right_keys = list(map(negate, source[cut:]))
+        for value in (0, 5, 9):
+            key = negate(value)
+            assert left.bisect_key_left(key) == bisect_left(left_keys, key)
+            assert left.bisect_key_right(key) == bisect_right(left_keys, key)
+            assert right.bisect_key_left(key) == bisect_left(right_keys, key)
+            assert right.bisect_key_right(key) == bisect_right(right_keys, key)
+
+        # Parts reassemble into the whole.
+        assert list(left.concat(right)) == source
+
+        # Mutating a part affects neither the original nor the other part.
+        left.add(100)
+        assert list(skl) == source
+        assert list(right) == source[cut:]
+
+
+def test_concat():
+    skl1 = SortedKeyList([val // 4 for val in range(20)], key=negate)
+    skl2 = SortedKeyList([val // 4 for val in range(20, 45)], key=negate)
+    skl1._reset(4)
+    skl2._reset(4)
+    assert len(skl1._lists) > 1
+    assert len(skl2._lists) > 1
+
+    # With the negate key, larger values sort first.
+    result = skl2.concat(skl1)
+    result._check()
+    assert isinstance(result, SortedKeyList)
+    assert result.key is negate
+
+    combined = list(skl2) + list(skl1)
+    assert list(result) == combined
+    assert len(result) == len(combined)
+
+    # Positional indexing and key-bisect work on the concatenated result.
+    for pos, value in enumerate(combined):
+        assert result[pos] == value
+    combined_keys = list(map(negate, combined))
+    for value in (0, 4, 5, 11):
+        key = negate(value)
+        assert result.bisect_key_left(key) == bisect_left(combined_keys, key)
+        assert result.bisect_key_right(key) == bisect_right(combined_keys, key)
+
+    # Originals are unchanged and share no mutable sublists with the result.
+    assert list(skl1) == combined[len(skl2):]
+    assert list(skl2) == combined[:len(skl2)]
+    result_ids = set(map(id, result._lists + result._keys))
+    assert not result_ids & set(map(id, skl1._lists + skl1._keys))
+    assert not result_ids & set(map(id, skl2._lists + skl2._keys))
+    result.add(100)
+    assert list(skl1) == combined[len(skl2):]
+    assert list(skl2) == combined[:len(skl2)]
+    result._check()
+
+    # Concatenating with an empty sorted-key list copies sublists.
+    empty = SortedKeyList(key=negate)
+    empty._reset(4)
+    assert list(empty.concat(skl1)) == list(skl1)
+    assert list(skl1.concat(empty)) == list(skl1)
+    copied = empty.concat(skl1)
+    assert not set(map(id, copied._lists)) & set(map(id, skl1._lists))
+
+
+def test_concat_errors():
+    skl1 = SortedKeyList(range(10), key=negate)
+    skl2 = SortedKeyList(range(10, 20), key=negate)
+    skl1._reset(4)
+    skl2._reset(4)
+
+    with pytest.raises(TypeError):
+        skl2.concat(SortedList(range(10)))
+
+    with pytest.raises(ValueError):
+        skl1.concat(skl2)
+
+    skl3 = SortedKeyList(range(10, 20), key=lambda val: -val)
+    skl3._reset(4)
+    with pytest.raises(ValueError):
+        skl2.concat(skl3)
+
+    skl4 = SortedKeyList(range(10, 20), key=negate)
+    skl4._reset(5)
+    with pytest.raises(ValueError):
+        skl2.concat(skl4)

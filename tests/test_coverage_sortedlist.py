@@ -1,5 +1,7 @@
 import random
-from sortedcontainers import SortedList
+from bisect import bisect_left, bisect_right
+from operator import neg
+from sortedcontainers import SortedList, SortedKeyList
 from itertools import chain
 import pytest
 
@@ -672,3 +674,155 @@ def test_check():
     slt._len = 5
     with pytest.raises(AssertionError):
         slt._check()
+
+
+def test_split():
+    values = [val // 3 for val in range(30)]
+    source = sorted(values)
+    slt = SortedList(values)
+    slt._reset(4)
+    assert len(slt._lists) > 2
+
+    for index in range(-35, 36):
+        left, right = slt.split(index)
+
+        # The original is not consumed.
+        assert list(slt) == source
+        slt._check()
+
+        cut = index + len(source) if index < 0 else index
+        cut = min(max(cut, 0), len(source))
+        assert len(left) == cut
+        assert len(right) == len(source) - cut
+
+        # Split is positional; duplicates keep their order on both sides.
+        assert list(left) == source[:cut]
+        assert list(right) == source[cut:]
+        left._check()
+        right._check()
+
+        # Results share no mutable sublists with the original or each other.
+        original_ids = set(map(id, slt._lists))
+        left_ids = set(map(id, left._lists))
+        assert not original_ids & left_ids
+        assert not original_ids & set(map(id, right._lists))
+        assert not left_ids & set(map(id, right._lists))
+
+        # Positional indexing and bisect work on both parts.
+        for pos, value in enumerate(source[:cut]):
+            assert left[pos] == value
+        for pos, value in enumerate(source[cut:]):
+            assert right[pos] == value
+        for value in (0, 5, 9):
+            assert left.bisect_left(value) == bisect_left(source[:cut], value)
+            assert left.bisect_right(value) == bisect_right(source[:cut], value)
+            assert right.bisect_left(value) == bisect_left(source[cut:], value)
+            assert right.bisect_right(value) == bisect_right(source[cut:], value)
+
+        # Parts reassemble into the whole.
+        assert list(left.concat(right)) == source
+
+        # Mutating a part affects neither the original nor the other part.
+        left.add(-1)
+        assert list(slt) == source
+        assert list(right) == source[cut:]
+
+
+def test_concat():
+    values1 = [val // 4 for val in range(20)]
+    values2 = [val // 4 for val in range(20, 45)]
+    slt1 = SortedList(values1)
+    slt2 = SortedList(values2)
+    slt1._reset(4)
+    slt2._reset(4)
+    assert len(slt1._lists) > 1
+    assert len(slt2._lists) > 1
+
+    result = slt1.concat(slt2)
+    result._check()
+
+    combined = sorted(values1 + values2)
+    assert list(result) == combined
+    assert len(result) == len(combined)
+
+    # Positional indexing and bisect work on the concatenated result.
+    for pos, value in enumerate(combined):
+        assert result[pos] == value
+    for value in (0, 4, 5, 11):
+        assert result.bisect_left(value) == bisect_left(combined, value)
+        assert result.bisect_right(value) == bisect_right(combined, value)
+
+    # Originals are unchanged and share no mutable sublists with the result.
+    assert list(slt1) == sorted(values1)
+    assert list(slt2) == sorted(values2)
+    result_ids = set(map(id, result._lists))
+    assert not result_ids & set(map(id, slt1._lists))
+    assert not result_ids & set(map(id, slt2._lists))
+    result.add(-1)
+    assert list(slt1) == sorted(values1)
+    assert list(slt2) == sorted(values2)
+    result._check()
+
+    # Concatenating with an empty sorted list copies sublists.
+    empty = SortedList()
+    empty._reset(4)
+    assert list(empty.concat(slt1)) == sorted(values1)
+    assert list(slt1.concat(empty)) == sorted(values1)
+    assert list(empty.concat(empty)) == []
+    copied = empty.concat(slt1)
+    assert not set(map(id, copied._lists)) & set(map(id, slt1._lists))
+
+
+def test_concat_merges_boundary_sublists():
+    slt = SortedList(range(40))
+    slt._reset(4)
+    left, right = slt.split(21)
+    assert len(left._lists[-1]) < 4
+    assert len(right._lists[0]) < 4
+
+    result = left.concat(right)
+    result._check()
+    assert list(result) == list(range(40))
+    assert len(result._lists) < len(left._lists) + len(right._lists)
+
+
+def test_concat_rebalances_boundary_sublists():
+    slt1 = SortedList(range(18))
+    slt1._reset(4)
+    # Leave a single value in the last sublist.
+    left, _ = slt1.split(17)
+    assert len(left._lists[-1]) == 1
+
+    # Grow the second sublist to double the load factor.
+    source = SortedList(range(16, 56))
+    source._reset(4)
+    source.update([20, 21, 22, 22])
+    _, right = source.split(4)
+    assert len(right._lists[0]) == 8
+
+    result = left.concat(right)
+    result._check()
+    assert list(result) == list(left) + list(right)
+
+
+def test_concat_errors():
+    slt1 = SortedList(range(10))
+    slt2 = SortedList(range(10, 20))
+    slt1._reset(4)
+    slt2._reset(4)
+
+    with pytest.raises(TypeError):
+        slt1.concat(list(range(10, 20)))
+
+    with pytest.raises(ValueError):
+        slt2.concat(slt1)
+
+    slt3 = SortedList(range(10, 20))
+    slt3._reset(5)
+    with pytest.raises(ValueError):
+        slt1.concat(slt3)
+
+    skl = SortedKeyList(range(10, 20), key=neg)
+    skl._reset(4)
+    with pytest.raises(ValueError):
+        slt1.concat(skl)

@@ -68,6 +68,11 @@ class SortedList(MutableSequence):
     * :func:`SortedList.__iter__`
     * :func:`SortedList.__reversed__`
 
+    Methods for splitting and concatenating:
+
+    * :func:`SortedList.split`
+    * :func:`SortedList.concat`
+
     Methods for miscellany:
 
     * :func:`SortedList.copy`
@@ -1449,6 +1454,182 @@ class SortedList(MutableSequence):
         self._update(values)
         return self
 
+    def _split_blocks(self, blocks, index):
+        """Split list of sublists `blocks` at flat `index` into two new lists
+        of sublists.
+
+        Whole sublists are shallow-copied so the returned pairs share no
+        mutable state with `blocks`. The first sublist of the right pair is
+        merged or rebalanced with its successor when the cut leaves it
+        smaller than half the load factor. Requires
+        ``0 <= index <= self._len``.
+
+        :param blocks: list of sublists to split
+        :param int index: flat index at which to split
+        :return: pair of lists of sublists
+
+        """
+        if index <= 0:
+            return [], [list(sublist) for sublist in blocks]
+
+        if index >= self._len:
+            return [list(sublist) for sublist in blocks], []
+
+        pos, idx = self._pos(index)
+
+        left = [list(sublist) for sublist in blocks[:pos]]
+        right = [list(sublist) for sublist in blocks[pos:]]
+
+        if idx:
+            left.append(blocks[pos][:idx])
+            right[0] = blocks[pos][idx:]
+
+            _load = self._load
+
+            if len(right) > 1 and len(right[0]) < (_load >> 1):
+                right[0].extend(right[1])
+
+                if len(right[0]) <= (_load << 1):
+                    del right[1]
+                else:
+                    right[1] = right[0][_load:]
+                    del right[0][_load:]
+
+        return left, right
+
+    def split(self, index):
+        """Return two new sorted lists splitting the sorted list at `index`.
+
+        ``left, right = sl.split(index)`` is equivalent to ``sl[:index]`` and
+        ``sl[index:]`` as new sorted lists.
+
+        The `index` is a position (rank) rather than a value. Duplicate
+        values may be split between the two returned lists. A negative
+        `index` is normalized like sequence slicing and clamped to the bounds
+        of the sorted list.
+
+        The sorted list is not modified (not consumed). The returned sorted
+        lists share no mutable sublists with the original or with each other.
+
+        Runtime complexity: `O(n)` -- whole sublists are reused without
+        re-sorting.
+
+        >>> sl = SortedList('sortedcontainers')
+        >>> sl._reset(4)
+        >>> left, right = sl.split(7)
+        >>> left
+        SortedList(['a', 'c', 'd', 'e', 'e', 'i', 'n'])
+        >>> right
+        SortedList(['n', 'o', 'o', 'r', 'r', 's', 's', 't', 't'])
+        >>> sl
+        SortedList(['a', 'c', 'd', 'e', 'e', 'i', 'n', 'n', 'o', 'o', 'r', 'r', 's', 's', 't', 't'])
+
+        :param int index: position at which to split the sorted list
+        :return: pair of new sorted lists
+
+        """
+        if index < 0:
+            index += self._len
+            if index < 0:
+                index = 0
+        elif index > self._len:
+            index = self._len
+
+        left_lists, right_lists = self._split_blocks(self._lists, index)
+
+        left = self.__class__()
+        left._load = self._load
+        left._lists = left_lists
+        left._maxes = [sublist[-1] for sublist in left_lists]
+        left._len = index
+
+        right = self.__class__()
+        right._load = self._load
+        right._lists = right_lists
+        right._maxes = [sublist[-1] for sublist in right_lists]
+        right._len = self._len - index
+
+        return left, right
+
+    def _concat_blocks(self, left_blocks, right_blocks):
+        """Concatenate two lists of sublists into a new list of sublists.
+
+        Whole sublists are shallow-copied so the result shares no mutable
+        state with either argument. The two boundary sublists are merged or
+        rebalanced to maintain the load-factor invariants.
+
+        :param left_blocks: sublists of the left sorted list
+        :param right_blocks: sublists of the right sorted list
+        :return: new list of sublists
+
+        """
+        _load = self._load
+        lists = [list(sublist) for sublist in left_blocks]
+        tail = [list(sublist) for sublist in right_blocks]
+
+        if lists and tail:
+            if len(lists[-1]) + len(tail[0]) <= (_load << 1):
+                lists[-1].extend(tail[0])
+                del tail[0]
+            elif len(lists[-1]) < (_load >> 1):
+                need = (_load >> 1) - len(lists[-1])
+                lists[-1].extend(tail[0][:need])
+                del tail[0][:need]
+
+        lists.extend(tail)
+        return lists
+
+    def concat(self, other):
+        """Return new sorted list concatenating `other` after the sorted list.
+
+        Unlike :func:`SortedList.__add__`, all values in the sorted list must
+        be less than or equal to all values in `other`. Both sorted lists
+        must also use the same key function and load factor.
+
+        The sorted list and `other` are not modified. The returned sorted
+        list shares no mutable sublists with either.
+
+        Runtime complexity: `O(n)` -- whole sublists are reused without
+        re-sorting.
+
+        >>> sl1 = SortedList('abc')
+        >>> sl2 = SortedList('def')
+        >>> sl1.concat(sl2)
+        SortedList(['a', 'b', 'c', 'd', 'e', 'f'])
+        >>> sl2.concat(sl1)
+        Traceback (most recent call last):
+          ...
+        ValueError: values in `other` must be greater than or equal to values in the sorted list
+
+        :param other: other sorted list
+        :return: new sorted list
+        :raises TypeError: `other` is not a sorted list
+        :raises ValueError: key functions or load factors differ, or values
+            are out of order
+
+        """
+        if not isinstance(other, SortedList):
+            raise TypeError('can only concatenate another SortedList')
+
+        if self.key != other.key:
+            raise ValueError('key functions of sorted lists must match')
+
+        if self._load != other._load:
+            raise ValueError('load factors of sorted lists must match')
+
+        if self._len and other._len and self._maxes[-1] > other._lists[0][0]:
+            raise ValueError(
+                'values in `other` must be greater than or equal to values in'
+                ' the sorted list'
+            )
+
+        new = self.__class__()
+        new._load = self._load
+        new._lists = self._concat_blocks(self._lists, other._lists)
+        new._maxes = [sublist[-1] for sublist in new._lists]
+        new._len = self._len + other._len
+        return new
+
     def __make_cmp(seq_op, symbol, doc):
         "Make comparator method."
 
@@ -2426,6 +2607,120 @@ class SortedKeyList(SortedList):
         """
         values = reduce(iadd, self._lists, []) * num
         return self.__class__(values, key=self._key)
+
+    def split(self, index):
+        """Return two new sorted-key lists splitting the sorted-key list at
+        `index`.
+
+        ``left, right = skl.split(index)`` is equivalent to ``skl[:index]``
+        and ``skl[index:]`` as new sorted-key lists.
+
+        The `index` is a position (rank) rather than a value or key.
+        Duplicate values may be split between the two returned lists. A
+        negative `index` is normalized like sequence slicing and clamped to
+        the bounds of the sorted-key list.
+
+        The sorted-key list is not modified (not consumed). The returned
+        sorted-key lists use the same key function and share no mutable
+        sublists with the original or with each other.
+
+        Runtime complexity: `O(n)` -- whole sublists are reused without
+        re-sorting.
+
+        >>> from operator import neg
+        >>> skl = SortedKeyList(range(10), key=neg)
+        >>> skl._reset(4)
+        >>> left, right = skl.split(4)
+        >>> left
+        SortedKeyList([9, 8, 7, 6], key=<built-in function neg>)
+        >>> right
+        SortedKeyList([5, 4, 3, 2, 1, 0], key=<built-in function neg>)
+        >>> skl
+        SortedKeyList([9, 8, 7, 6, 5, 4, 3, 2, 1, 0], key=<built-in function neg>)
+
+        :param int index: position at which to split the sorted-key list
+        :return: pair of new sorted-key lists
+
+        """
+        if index < 0:
+            index += self._len
+            if index < 0:
+                index = 0
+        elif index > self._len:
+            index = self._len
+
+        left_lists, right_lists = self._split_blocks(self._lists, index)
+        left_keys, right_keys = self._split_blocks(self._keys, index)
+
+        left = self.__class__(key=self._key)
+        left._load = self._load
+        left._lists = left_lists
+        left._keys = left_keys
+        left._maxes = [sublist[-1] for sublist in left_keys]
+        left._len = index
+
+        right = self.__class__(key=self._key)
+        right._load = self._load
+        right._lists = right_lists
+        right._keys = right_keys
+        right._maxes = [sublist[-1] for sublist in right_keys]
+        right._len = self._len - index
+
+        return left, right
+
+    def concat(self, other):
+        """Return new sorted-key list concatenating `other` after the
+        sorted-key list.
+
+        Unlike :func:`SortedKeyList.__add__`, all keys in the sorted-key list
+        must be less than or equal to all keys in `other`. Both sorted-key
+        lists must also use the same key function and load factor.
+
+        The sorted-key list and `other` are not modified. The returned
+        sorted-key list shares no mutable sublists with either.
+
+        Runtime complexity: `O(n)` -- whole sublists are reused without
+        re-sorting.
+
+        >>> from operator import neg
+        >>> skl1 = SortedKeyList([5, 4, 3], key=neg)
+        >>> skl2 = SortedKeyList([2, 1, 0], key=neg)
+        >>> skl1.concat(skl2)
+        SortedKeyList([5, 4, 3, 2, 1, 0], key=<built-in function neg>)
+        >>> skl2.concat(skl1)
+        Traceback (most recent call last):
+          ...
+        ValueError: keys in `other` must be greater than or equal to keys in the sorted-key list
+
+        :param other: other sorted-key list
+        :return: new sorted-key list
+        :raises TypeError: `other` is not a sorted-key list
+        :raises ValueError: key functions or load factors differ, or keys
+            are out of order
+
+        """
+        if not isinstance(other, SortedKeyList):
+            raise TypeError('can only concatenate another SortedKeyList')
+
+        if self._key != other._key:
+            raise ValueError('key functions of sorted-key lists must match')
+
+        if self._load != other._load:
+            raise ValueError('load factors of sorted-key lists must match')
+
+        if self._len and other._len and self._maxes[-1] > other._keys[0][0]:
+            raise ValueError(
+                'keys in `other` must be greater than or equal to keys in'
+                ' the sorted-key list'
+            )
+
+        new = self.__class__(key=self._key)
+        new._load = self._load
+        new._lists = self._concat_blocks(self._lists, other._lists)
+        new._keys = self._concat_blocks(self._keys, other._keys)
+        new._maxes = [sublist[-1] for sublist in new._keys]
+        new._len = self._len + other._len
+        return new
 
     def __reduce__(self):
         values = reduce(iadd, self._lists, [])

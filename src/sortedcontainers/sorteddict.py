@@ -47,6 +47,10 @@ class SortedDict(dict):
     * :func:`SortedDict.setdefault`
     * :func:`SortedDict.update`
 
+    Methods for batch editing:
+
+    * :func:`SortedDict.batch_update`
+
     Methods for removing items:
 
     * :func:`SortedDict.clear`
@@ -516,6 +520,94 @@ class SortedDict(dict):
                 self._setitem(key, pairs[key])
 
     _update = update
+
+    def batch_update(self, updates=(), removals=()):
+        """Apply `updates` and `removals` to the sorted dict as one batch.
+
+        The batch commits only when every operation succeeds: either all
+        items are added, replaced and removed together, or, when an error
+        occurs, the sorted dict is left exactly as it was. Errors raised by
+        the key function or by key comparisons while staging the batch never
+        corrupt the sorted dict: the sublist blocks, the maxes index and the
+        dictionary member table all remain identical to their pre-batch
+        state.
+
+        Argument `updates` is a mapping or an iterable of pairs, like the
+        argument to :func:`SortedDict.update`. Duplicate keys collapse as in
+        a dict: the last value wins. Updating a key that is already present
+        replaces its value; the key's position is unchanged.
+
+        Argument `removals` is an iterable of keys to delete. Duplicate
+        entries are ignored. Removing a key that is not present aborts the
+        whole batch with :exc:`KeyError` and applies nothing. Removals are
+        applied before updates, so a key present in both is first removed
+        and then re-added, remaining with its new value.
+
+        The staged result is committed by swapping the new key list and
+        member table into place at once. The commit is not a lock-free
+        atomic operation across threads: concurrent readers may observe
+        intermediate states. Use external synchronization when sharing a
+        sorted dict between threads.
+
+        Views returned by :func:`SortedDict.keys`, :func:`SortedDict.items`
+        and :func:`SortedDict.values` reference the sorted dict's internal
+        list, which is replaced in place, so existing views reflect the
+        committed state. Iterators already in progress behave as with any
+        mutation during iteration: they may raise :exc:`RuntimeError` or
+        skip or repeat items.
+
+        Runtime complexity: `O(n*log(n))` -- approximate.
+
+        >>> sd = SortedDict({'a': 1, 'b': 2, 'c': 3})
+        >>> sd.batch_update({'b': 20, 'd': 4}, removals=['a'])
+        >>> sd
+        SortedDict({'b': 20, 'c': 3, 'd': 4})
+        >>> sd.batch_update(removals=['z'])
+        Traceback (most recent call last):
+          ...
+        KeyError: 'z'
+        >>> sd
+        SortedDict({'b': 20, 'c': 3, 'd': 4})
+
+        :param updates: mapping or iterable of pairs to add or replace
+        :param removals: iterable of keys to remove
+        :raises KeyError: if a key in `removals` is not found
+
+        """
+        # Normalize the batch before touching any live state. Collapsing
+        # duplicates with a dict makes the last update win and ignores
+        # duplicate removals. Malformed pairs or unhashable keys raise here,
+        # before the sorted dict is modified.
+        updates = dict(updates)
+        removals = dict.fromkeys(removals)
+
+        # Validate removals against the current keys. A missing key aborts
+        # the batch with nothing applied.
+        for key in removals:
+            if key not in self:
+                raise KeyError(key)
+
+        # Stage the new member table as a plain dict. Hashing of new keys
+        # happens here, still before the sorted dict is modified.
+        new_items = dict.copy(self)
+        for key in removals:
+            del new_items[key]
+        new_items.update(updates)
+
+        # Stage the new sorted key list. Key-function and comparison errors
+        # raised here leave the sorted dict untouched.
+        new_list = SortedList(dict.__iter__(new_items), key=self._key)
+
+        _list = self._list
+        if new_list._load != _list._load:
+            new_list._reset(_list._load)
+
+        # Commit: swap the staged structures into place at once. The sorted
+        # list is updated in place so cached method references and existing
+        # views observe the new state.
+        vars(_list).update(vars(new_list))
+        dict.clear(self)
+        dict.update(self, new_items)
 
     def __reduce__(self):
         """Support for pickle.

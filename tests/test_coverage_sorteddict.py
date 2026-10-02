@@ -315,6 +315,176 @@ def test_update2():
     assert list(temp.items()) == mapping
 
 
+def test_batch_update():
+    temp = SortedDict({'a': 1, 'b': 2, 'c': 3})
+    temp.batch_update({'b': 20, 'd': 4}, removals=['a'])
+    assert temp == {'b': 20, 'c': 3, 'd': 4}
+    assert list(temp) == ['b', 'c', 'd']
+    temp._check()
+
+
+def test_batch_update_empty():
+    temp = SortedDict({'a': 1})
+    temp.batch_update()
+    assert temp == {'a': 1}
+    temp._check()
+
+
+def test_batch_update_duplicates():
+    temp = SortedDict({'a': 1})
+    temp.batch_update([('b', 1), ('b', 2)])
+    assert temp['b'] == 2
+    temp.batch_update({'c': 3})
+    temp.batch_update(removals=['c', 'c'])
+    assert temp == {'a': 1, 'b': 2}
+    temp._check()
+
+
+def test_batch_update_remove_and_readd():
+    temp = SortedDict({'a': 1, 'b': 2})
+    temp.batch_update({'a': 10}, removals=['a'])
+    assert temp == {'a': 10, 'b': 2}
+    assert list(temp) == ['a', 'b']
+    temp._check()
+
+
+def test_batch_update_missing_removal():
+    temp = SortedDict({'a': 1})
+    with pytest.raises(KeyError):
+        temp.batch_update({'b': 2}, removals=['z'])
+    assert temp == {'a': 1}
+    assert list(temp) == ['a']
+    temp._check()
+
+
+def test_batch_update_key_function():
+    temp = SortedDict(negate, {1: 'a', 2: 'b', 3: 'c'})
+    temp.batch_update({4: 'd'}, removals=[1])
+    assert list(temp) == [4, 3, 2]
+    assert list(temp.values()) == ['d', 'c', 'b']
+    temp._check()
+
+
+def test_batch_update_load_factor():
+    mapping = [(val, pos) for pos, val in enumerate(string.ascii_lowercase)]
+    temp = SortedDict(mapping)
+    temp._reset(10)
+    temp.batch_update({'A': -1}, removals=['z'])
+    assert temp._list._load == 10
+    temp._check()
+
+
+def test_batch_update_views():
+    temp = SortedDict({'a': 1, 'b': 2})
+    keys_view = temp.keys()
+    items_view = temp.items()
+    values_view = temp.values()
+    temp.batch_update({'c': 3}, removals=['a'])
+    assert list(keys_view) == ['b', 'c']
+    assert list(items_view) == [('b', 2), ('c', 3)]
+    assert list(values_view) == [2, 3]
+    temp._check()
+
+
+class FlakyKey:
+    """Key whose comparison raises once a call limit is exceeded."""
+
+    limit = None
+    count = 0
+
+    def __init__(self, value):
+        self.value = value
+
+    def __lt__(self, other):
+        FlakyKey.count += 1
+        if FlakyKey.limit is not None and FlakyKey.count > FlakyKey.limit:
+            raise RuntimeError('comparison failed')
+        return self.value < other.value
+
+    def __le__(self, other):
+        return not other.__lt__(self)
+
+    def __eq__(self, other):
+        return isinstance(other, FlakyKey) and self.value == other.value
+
+    def __hash__(self):
+        return hash(self.value)
+
+    def __repr__(self):
+        return f'FlakyKey({self.value!r})'
+
+
+def test_batch_update_comparison_failure():
+    FlakyKey.count = 0
+    FlakyKey.limit = None
+    keys = [FlakyKey(pos) for pos in range(10)]
+    temp = SortedDict((key, pos) for pos, key in enumerate(keys))
+
+    # Force the positional index to be built so it joins the snapshot.
+    temp.index(keys[5])
+    temp._check()
+
+    before_items = dict(temp)
+    before_lists = [list(sublist) for sublist in temp._list._lists]
+    before_maxes = list(temp._list._maxes)
+    before_index = list(temp._list._index)
+    before_len = temp._list._len
+
+    # Arm comparisons to fail partway through the batch.
+    FlakyKey.limit = FlakyKey.count + 5
+
+    with pytest.raises(RuntimeError):
+        temp.batch_update(
+            {FlakyKey(100): 100, FlakyKey(200): 200},
+            removals=[keys[0]],
+        )
+
+    FlakyKey.limit = None
+
+    # Members and internal indexes are identical to the pre-batch state.
+    assert dict(temp) == before_items
+    assert temp._list._lists == before_lists
+    assert temp._list._maxes == before_maxes
+    assert temp._list._index == before_index
+    assert temp._list._len == before_len
+    temp._check()
+
+    # Retrying the batch now succeeds.
+    temp.batch_update({FlakyKey(100): 100}, removals=[keys[0]])
+    assert len(temp) == 10
+    assert keys[0] not in temp
+    assert temp[FlakyKey(100)] == 100
+    temp._check()
+
+
+def test_batch_update_key_function_failure():
+    def keyfunc(value):
+        if value == 'boom':
+            raise ValueError('key function failed')
+        return value
+
+    temp = SortedDict(keyfunc, {'a': 1, 'b': 2})
+    temp._check()
+
+    before_items = dict(temp)
+    before_lists = [list(sublist) for sublist in temp._list._lists]
+    before_keys = [list(sublist) for sublist in temp._list._keys]
+    before_maxes = list(temp._list._maxes)
+
+    with pytest.raises(ValueError):
+        temp.batch_update({'boom': 3}, removals=['a'])
+
+    assert dict(temp) == before_items
+    assert temp._list._lists == before_lists
+    assert temp._list._keys == before_keys
+    assert temp._list._maxes == before_maxes
+    temp._check()
+
+    temp.batch_update({'c': 3}, removals=['a'])
+    assert temp == {'b': 2, 'c': 3}
+    temp._check()
+
+
 def test_repr():
     temp = SortedDict({'alice': 3, 'bob': 1, 'carol': 2, 'dave': 4})
     assert repr(temp) == "SortedDict({'alice': 3, 'bob': 1, 'carol': 2, 'dave': 4})"

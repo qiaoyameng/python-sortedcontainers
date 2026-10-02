@@ -68,6 +68,11 @@ class SortedList(MutableSequence):
     * :func:`SortedList.__iter__`
     * :func:`SortedList.__reversed__`
 
+    Methods for splitting and joining:
+
+    * :func:`SortedList.split`
+    * :func:`SortedList.join`
+
     Methods for miscellany:
 
     * :func:`SortedList.copy`
@@ -296,6 +301,212 @@ class SortedList(MutableSequence):
         del self._index[:]
 
     _update = update
+
+    def split(self, index):
+        """Split sorted list at `index` into two sorted lists by rank.
+
+        ``left, right = sl.split(index)`` splits the sorted list by rank
+        (position) rather than by value: `left` receives ``sl[:index]``
+        and `right` receives ``sl[index:]``. Duplicate values may be
+        divided between the two results.
+
+        The sorted list is consumed by the operation: ``sl`` is empty
+        afterwards. Whole internal sublists are moved rather than copied
+        so the results share no mutable state with each other or with
+        the original sorted list.
+
+        Runtime complexity: `O(log(n))` -- approximate.
+
+        >>> sl = SortedList('abcde')
+        >>> left, right = sl.split(2)
+        >>> left
+        SortedList(['a', 'b'])
+        >>> right
+        SortedList(['c', 'd', 'e'])
+        >>> sl
+        SortedList([])
+
+        :param int index: rank at which to split the sorted list
+        :return: pair of sorted lists ``(left, right)``
+        :raises IndexError: if index out of range
+
+        """
+        _len = self._len
+
+        if index < 0:
+            index += _len
+
+        if index < 0 or index > _len:
+            raise IndexError('list index out of range')
+
+        left = self.__class__()
+        right = self.__class__()
+        left._load = self._load
+        right._load = self._load
+
+        _lists = self._lists
+        _maxes = self._maxes
+
+        if index == 0:
+            right._len = _len
+            right._lists = _lists
+            right._maxes = _maxes
+        elif index == _len:
+            left._len = _len
+            left._lists = _lists
+            left._maxes = _maxes
+        else:
+            pos, idx = self._pos(index)
+
+            if idx:
+                block = _lists[pos]
+                left_lists = _lists[:pos] + [block[:idx]]
+                right_lists = [block[idx:]] + _lists[pos + 1 :]
+
+                # Merge an undersized first sublist of the right part
+                # with its successor so that all but the last sublist
+                # remain at least half the load factor.
+
+                _load = self._load
+
+                if len(right_lists) > 1 and len(right_lists[0]) < (_load >> 1):
+                    merged = right_lists[0] + right_lists[1]
+
+                    if len(merged) > (_load << 1):
+                        right_lists[:2] = [merged[:_load], merged[_load:]]
+                    else:
+                        right_lists[:2] = [merged]
+            else:
+                left_lists = _lists[:pos]
+                right_lists = _lists[pos:]
+
+            left._len = index
+            left._lists = left_lists
+            left._maxes = [sublist[-1] for sublist in left_lists]
+            right._len = _len - index
+            right._lists = right_lists
+            right._maxes = [sublist[-1] for sublist in right_lists]
+
+        # Consume the original sorted list. Rebind rather than clear so
+        # that sublists transferred above are not mutated.
+
+        self._len = 0
+        self._lists = []
+        self._maxes = []
+        self._index = []
+        self._offset = 0
+
+        return left, right
+
+    def join(self, other):
+        """Update sorted list by joining sorted list `other` in order.
+
+        The greatest value in the sorted list must be less than or equal
+        to the least value in `other` so that the concatenation remains
+        sorted. Both sorted lists must also use the same key-function
+        configuration.
+
+        `other` is consumed by the operation and is empty afterwards.
+        Whole internal sublists of `other` are moved rather than copied
+        whenever possible. If the sorted list is empty then it takes on
+        the load factor of `other`.
+
+        Runtime complexity: `O(k)` -- approximate, where `k` is the
+        number of internal sublists in `other`.
+
+        >>> sl1 = SortedList('abc')
+        >>> sl2 = SortedList('cde')
+        >>> sl1.join(sl2)
+        >>> sl1
+        SortedList(['a', 'b', 'c', 'c', 'd', 'e'])
+        >>> sl2
+        SortedList([])
+
+        :param other: sorted list to join in order
+        :raises TypeError: if `other` is not a sorted list
+        :raises ValueError: if key functions differ, values are out of
+            order, or `other` is the sorted list itself
+
+        """
+        if not isinstance(other, SortedList):
+            raise TypeError('join requires a SortedList instance')
+
+        if other is self:
+            raise ValueError('cannot join a sorted list with itself')
+
+        if self.key is not other.key:
+            raise ValueError('sorted lists have different key functions')
+
+        if not other._len:
+            return
+
+        if not self._len:
+            self._len = other._len
+            self._load = other._load
+            self._lists = other._lists
+            self._maxes = other._maxes
+            other._len = 0
+            other._lists = []
+            other._maxes = []
+            other._index = []
+            other._offset = 0
+            return
+
+        _other_lists = other._lists
+
+        if self._maxes[-1] > _other_lists[0][0]:
+            raise ValueError('values out of order for join')
+
+        total = self._len + other._len
+        _lists = self._lists
+        _maxes = self._maxes
+
+        if self._load == other._load:
+            # Merge undersized boundary sublists so that all but the
+            # last sublist remain at least half the load factor.
+
+            if len(_lists[-1]) < (self._load >> 1):
+                block = _lists[-1]
+                block.extend(_other_lists.pop(0))
+                other._maxes.pop(0)
+
+                if len(block) > (self._load << 1):
+                    _load = self._load
+                    rest = block[_load:]
+                    del block[_load:]
+                    _other_lists.insert(0, rest)
+                    other._maxes.insert(0, rest[-1])
+
+                _maxes[-1] = block[-1]
+
+            _lists.extend(_other_lists)
+            _maxes.extend(other._maxes)
+        else:
+            # Re-block the values of `other` at the load factor of the
+            # sorted list. Values are already sorted so the boundary
+            # sublist is simply concatenated and re-chunked.
+
+            block = _lists.pop()
+            _maxes.pop()
+            values = block + reduce(iadd, _other_lists, [])
+            _load = self._load
+            blocks = [
+                values[pos : (pos + _load)] for pos in range(0, len(values), _load)
+            ]
+            _lists.extend(blocks)
+            _maxes.extend(sublist[-1] for sublist in blocks)
+
+        self._len = total
+        del self._index[:]
+
+        # Consume `other`. Rebind rather than clear so that sublists
+        # transferred above are not mutated.
+
+        other._len = 0
+        other._lists = []
+        other._maxes = []
+        other._index = []
+        other._offset = 0
 
     def __contains__(self, value):
         """Return true if `value` is an element of the sorted list.
@@ -1797,6 +2008,243 @@ class SortedKeyList(SortedList):
         del self._index[:]
 
     _update = update
+
+    def split(self, index):
+        """Split sorted-key list at `index` into two sorted-key lists.
+
+        ``left, right = skl.split(index)`` splits the sorted-key list by
+        rank (position) rather than by value: `left` receives
+        ``skl[:index]`` and `right` receives ``skl[index:]``. Duplicate
+        values may be divided between the two results.
+
+        The sorted-key list is consumed by the operation: ``skl`` is
+        empty afterwards. Whole internal sublists are moved rather than
+        copied so the results share no mutable state with each other or
+        with the original sorted-key list. Both results use the same key
+        function as the original sorted-key list.
+
+        Runtime complexity: `O(log(n))` -- approximate.
+
+        >>> from operator import neg
+        >>> skl = SortedKeyList([5, 4, 3, 2, 1], key=neg)
+        >>> left, right = skl.split(2)
+        >>> left
+        SortedKeyList([5, 4], key=<built-in function neg>)
+        >>> right
+        SortedKeyList([3, 2, 1], key=<built-in function neg>)
+        >>> skl
+        SortedKeyList([], key=<built-in function neg>)
+
+        :param int index: rank at which to split the sorted-key list
+        :return: pair of sorted-key lists ``(left, right)``
+        :raises IndexError: if index out of range
+
+        """
+        _len = self._len
+
+        if index < 0:
+            index += _len
+
+        if index < 0 or index > _len:
+            raise IndexError('list index out of range')
+
+        left = self.__class__(key=self._key)
+        right = self.__class__(key=self._key)
+        left._load = self._load
+        right._load = self._load
+
+        _lists = self._lists
+        _keys = self._keys
+        _maxes = self._maxes
+
+        if index == 0:
+            right._len = _len
+            right._lists = _lists
+            right._keys = _keys
+            right._maxes = _maxes
+        elif index == _len:
+            left._len = _len
+            left._lists = _lists
+            left._keys = _keys
+            left._maxes = _maxes
+        else:
+            pos, idx = self._pos(index)
+
+            if idx:
+                block = _lists[pos]
+                block_keys = _keys[pos]
+                left_lists = _lists[:pos] + [block[:idx]]
+                left_keys = _keys[:pos] + [block_keys[:idx]]
+                right_lists = [block[idx:]] + _lists[pos + 1 :]
+                right_keys = [block_keys[idx:]] + _keys[pos + 1 :]
+
+                # Merge an undersized first sublist of the right part
+                # with its successor so that all but the last sublist
+                # remain at least half the load factor.
+
+                _load = self._load
+
+                if len(right_lists) > 1 and len(right_lists[0]) < (_load >> 1):
+                    merged = right_lists[0] + right_lists[1]
+                    merged_keys = right_keys[0] + right_keys[1]
+
+                    if len(merged) > (_load << 1):
+                        right_lists[:2] = [merged[:_load], merged[_load:]]
+                        right_keys[:2] = [merged_keys[:_load], merged_keys[_load:]]
+                    else:
+                        right_lists[:2] = [merged]
+                        right_keys[:2] = [merged_keys]
+            else:
+                left_lists = _lists[:pos]
+                left_keys = _keys[:pos]
+                right_lists = _lists[pos:]
+                right_keys = _keys[pos:]
+
+            left._len = index
+            left._lists = left_lists
+            left._keys = left_keys
+            left._maxes = [sublist[-1] for sublist in left_keys]
+            right._len = _len - index
+            right._lists = right_lists
+            right._keys = right_keys
+            right._maxes = [sublist[-1] for sublist in right_keys]
+
+        # Consume the original sorted-key list. Rebind rather than clear
+        # so that sublists transferred above are not mutated.
+
+        self._len = 0
+        self._lists = []
+        self._keys = []
+        self._maxes = []
+        self._index = []
+        self._offset = 0
+
+        return left, right
+
+    def join(self, other):
+        """Update sorted-key list by joining sorted-key list `other` in order.
+
+        The greatest key in the sorted-key list must be less than or
+        equal to the least key in `other` so that the concatenation
+        remains sorted. Both sorted lists must also use the same key
+        function.
+
+        `other` is consumed by the operation and is empty afterwards.
+        Whole internal sublists of `other` are moved rather than copied
+        whenever possible. If the sorted-key list is empty then it takes
+        on the load factor of `other`.
+
+        Runtime complexity: `O(k)` -- approximate, where `k` is the
+        number of internal sublists in `other`.
+
+        >>> from operator import neg
+        >>> skl1 = SortedKeyList([5, 4, 3], key=neg)
+        >>> skl2 = SortedKeyList([2, 1, 0], key=neg)
+        >>> skl1.join(skl2)
+        >>> skl1
+        SortedKeyList([5, 4, 3, 2, 1, 0], key=<built-in function neg>)
+        >>> skl2
+        SortedKeyList([], key=<built-in function neg>)
+
+        :param other: sorted-key list to join in order
+        :raises TypeError: if `other` is not a sorted list
+        :raises ValueError: if key functions differ, keys are out of
+            order, or `other` is the sorted-key list itself
+
+        """
+        if not isinstance(other, SortedList):
+            raise TypeError('join requires a SortedList instance')
+
+        if other is self:
+            raise ValueError('cannot join a sorted list with itself')
+
+        if self._key is not other.key:
+            raise ValueError('sorted lists have different key functions')
+
+        if not other._len:
+            return
+
+        if not self._len:
+            self._len = other._len
+            self._load = other._load
+            self._lists = other._lists
+            self._keys = other._keys
+            self._maxes = other._maxes
+            other._len = 0
+            other._lists = []
+            other._keys = []
+            other._maxes = []
+            other._index = []
+            other._offset = 0
+            return
+
+        _other_lists = other._lists
+        _other_keys = other._keys
+
+        if self._maxes[-1] > _other_keys[0][0]:
+            raise ValueError('keys out of order for join')
+
+        total = self._len + other._len
+        _lists = self._lists
+        _keys = self._keys
+        _maxes = self._maxes
+
+        if self._load == other._load:
+            # Merge undersized boundary sublists so that all but the
+            # last sublist remain at least half the load factor.
+
+            if len(_lists[-1]) < (self._load >> 1):
+                block = _lists[-1]
+                block_keys = _keys[-1]
+                block.extend(_other_lists.pop(0))
+                block_keys.extend(_other_keys.pop(0))
+                other._maxes.pop(0)
+
+                if len(block) > (self._load << 1):
+                    _load = self._load
+                    rest = block[_load:]
+                    rest_keys = block_keys[_load:]
+                    del block[_load:]
+                    del block_keys[_load:]
+                    _other_lists.insert(0, rest)
+                    _other_keys.insert(0, rest_keys)
+                    other._maxes.insert(0, rest_keys[-1])
+
+                _maxes[-1] = block_keys[-1]
+
+            _lists.extend(_other_lists)
+            _keys.extend(_other_keys)
+            _maxes.extend(other._maxes)
+        else:
+            # Re-block the values of `other` at the load factor of the
+            # sorted-key list. Values are already sorted so the boundary
+            # sublist is simply concatenated and re-chunked.
+
+            block = _lists.pop()
+            _keys.pop()
+            _maxes.pop()
+            values = block + reduce(iadd, _other_lists, [])
+            _load = self._load
+            blocks = [
+                values[pos : (pos + _load)] for pos in range(0, len(values), _load)
+            ]
+            blocks_keys = [list(map(self._key, sublist)) for sublist in blocks]
+            _lists.extend(blocks)
+            _keys.extend(blocks_keys)
+            _maxes.extend(sublist[-1] for sublist in blocks_keys)
+
+        self._len = total
+        del self._index[:]
+
+        # Consume `other`. Rebind rather than clear so that sublists
+        # transferred above are not mutated.
+
+        other._len = 0
+        other._lists = []
+        other._keys = []
+        other._maxes = []
+        other._index = []
+        other._offset = 0
 
     def __contains__(self, value):
         """Return true if `value` is an element of the sorted-key list.

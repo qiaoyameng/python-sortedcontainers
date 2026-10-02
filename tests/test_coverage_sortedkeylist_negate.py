@@ -1,6 +1,7 @@
 import random
-from sortedcontainers import SortedKeyList, SortedListWithKey
+from sortedcontainers import SortedKeyList, SortedList, SortedListWithKey
 from itertools import chain
+from bisect import bisect_left, bisect_right
 import pytest
 
 
@@ -585,6 +586,266 @@ def test_op_add():
     that += that
     that += that
     assert that == (this * 4)
+
+
+def check_split_result(skl, expected):
+    assert list(skl) == expected
+    assert len(skl) == len(expected)
+
+    expected_keys = list(map(negate, expected))
+
+    for pos, value in enumerate(expected):
+        assert skl[pos] == value
+        assert skl[pos - len(expected)] == value
+        assert skl.index(value) == bisect_left(expected_keys, negate(value))
+
+    if expected:
+        keys = range(negate(expected[0]) - 1, negate(expected[-1]) + 2)
+    else:
+        keys = ()
+
+    for key in keys:
+        assert skl.bisect_key_left(key) == bisect_left(expected_keys, key)
+        assert skl.bisect_key_right(key) == bisect_right(expected_keys, key)
+
+    # Check invariants after the positional index has been built by the
+    # indexing and bisect operations above.
+
+    skl._check()
+
+
+def test_split():
+    random.seed(0)
+    values = [random.randrange(20) for _ in range(100)]
+    reference = sorted(values, key=negate)
+
+    for index in range(len(reference) + 1):
+        skl = SortedKeyList(values, key=negate)
+        skl._reset(4)
+        assert len(skl._lists) > 4
+
+        left, right = skl.split(index)
+
+        # Original sorted-key list is consumed.
+
+        assert list(skl) == []
+        assert len(skl) == 0
+        skl._check()
+
+        assert list(left) == reference[:index]
+        assert list(right) == reference[index:]
+        assert left.key is negate
+        assert right.key is negate
+        assert left._load == 4
+        assert right._load == 4
+        left._check()
+        right._check()
+
+        # Results share no mutable sublists with each other.
+
+        left_ids = set(map(id, left._lists)) | set(map(id, left._keys))
+        right_ids = set(map(id, right._lists)) | set(map(id, right._keys))
+        assert not (left_ids & right_ids)
+
+        # Results are independent: mutating one does not affect the
+        # other.
+
+        left.add(20)
+        right.add(-1)
+        assert list(left) == sorted(reference[:index] + [20], key=negate)
+        assert list(right) == sorted(reference[index:] + [-1], key=negate)
+        left._check()
+        right._check()
+
+
+def test_split_indexing():
+    random.seed(0)
+    values = [random.randrange(10) for _ in range(50)]
+    reference = sorted(values, key=negate)
+
+    # Split within a sublist, at sublist boundaries, and at the head and
+    # tail of the sorted-key list.
+
+    for index in (0, 1, 3, 4, 5, 8, 25, 44, 45, 48, 49, 50):
+        skl = SortedKeyList(values, key=negate)
+        skl._reset(4)
+        left, right = skl.split(index)
+        check_split_result(left, reference[:index])
+        check_split_result(right, reference[index:])
+
+
+def test_split_join_duplicate_order():
+    def first(pair):
+        return pair[0]
+
+    values = [(val, pos) for pos, val in enumerate([5, 3, 5, 1, 3, 5, 2, 3, 5, 1])]
+    reference = sorted(values, key=first)
+
+    # Duplicate keys may be divided between the two parts and the
+    # original order of duplicates is preserved by split and join.
+
+    for index in range(len(reference) + 1):
+        skl = SortedKeyList(values, key=first)
+        skl._reset(4)
+        left, right = skl.split(index)
+        assert list(left) == reference[:index]
+        assert list(right) == reference[index:]
+        left.join(right)
+        assert list(left) == reference
+        left._check()
+
+
+def test_split_indexerror():
+    skl = SortedKeyList(range(10), key=negate)
+
+    with pytest.raises(IndexError):
+        skl.split(11)
+
+    with pytest.raises(IndexError):
+        skl.split(-11)
+
+    assert list(skl) == list(range(9, -1, -1))
+    skl._check()
+
+
+def test_split_empty():
+    skl = SortedKeyList(key=negate)
+    left, right = skl.split(0)
+    assert list(left) == []
+    assert list(right) == []
+    assert left.key is negate
+    assert right.key is negate
+    left._check()
+    right._check()
+
+
+def test_split_boundary_resplit():
+    # Split so that the first sublist of the right part is undersized
+    # and merging it with its successor exceeds double the load factor.
+
+    skl = SortedKeyList(range(20), key=negate)
+    skl._reset(8)
+    skl._load = 4
+
+    left, right = skl.split(7)
+
+    assert list(left) == list(range(19, 12, -1))
+    assert list(right) == list(range(12, -1, -1))
+    left._check()
+    right._check()
+
+
+def test_join():
+    random.seed(0)
+    values = [random.randrange(20) for _ in range(100)]
+    reference = sorted(values, key=negate)
+
+    for index in range(len(reference) + 1):
+        skl = SortedKeyList(values, key=negate)
+        skl._reset(4)
+        left, right = skl.split(index)
+
+        left.join(right)
+
+        # Joining reassembles the original sorted-key list and consumes
+        # the argument.
+
+        assert list(left) == reference
+        assert list(right) == []
+        left._check()
+        right._check()
+
+
+def test_join_empty():
+    skl = SortedKeyList(range(10), key=negate)
+    skl._reset(4)
+
+    # Joining into an empty sorted-key list adopts the load factor.
+
+    that = SortedKeyList(key=negate)
+    that.join(skl)
+    assert list(that) == list(range(9, -1, -1))
+    assert that._load == 4
+    that._check()
+    assert list(skl) == []
+    skl._check()
+
+    # Joining an empty sorted-key list is a no-op.
+
+    that.join(SortedKeyList(key=negate))
+    assert list(that) == list(range(9, -1, -1))
+    that._check()
+
+
+def test_join_different_loads():
+    this = SortedKeyList(range(10, 31), key=negate)
+    this._reset(4)
+    that = SortedKeyList(range(10), key=negate)
+    that._reset(8)
+
+    this.join(that)
+
+    assert list(this) == list(range(30, -1, -1))
+    assert this._load == 4
+    this._check()
+    assert list(that) == []
+    that._check()
+
+
+def test_join_boundary_resplit():
+    # Join so that merging the undersized boundary sublists exceeds
+    # double the load factor and the merged sublist is split in two.
+
+    this = SortedKeyList(range(8, 9), key=negate)
+    this._reset(4)
+    that = SortedKeyList(range(8), key=negate)
+    that._reset(8)
+    that._load = 4
+
+    this.join(that)
+
+    assert list(this) == list(range(8, -1, -1))
+    this._check()
+    assert list(that) == []
+
+
+def test_join_valueerror():
+    this = SortedKeyList([3, 2, 1], key=negate)
+    that = SortedKeyList([7, 6, 5], key=negate)
+
+    with pytest.raises(ValueError):
+        this.join(that)
+
+    # Failed join leaves both sorted-key lists unchanged.
+
+    assert list(this) == [3, 2, 1]
+    assert list(that) == [7, 6, 5]
+    this._check()
+    that._check()
+
+
+def test_join_key_mismatch():
+    this = SortedKeyList([2, 1], key=negate)
+    that = SortedKeyList([4, 3], key=lambda val: -val)
+
+    with pytest.raises(ValueError):
+        this.join(that)
+
+    with pytest.raises(ValueError):
+        this.join(SortedList([3, 4]))
+
+    assert list(this) == [2, 1]
+    assert list(that) == [4, 3]
+
+
+def test_join_self():
+    skl = SortedKeyList([3, 2, 1], key=negate)
+
+    with pytest.raises(ValueError):
+        skl.join(skl)
+
+    assert list(skl) == [3, 2, 1]
+    skl._check()
 
 
 def test_eq():

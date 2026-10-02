@@ -1,6 +1,8 @@
 import random
-from sortedcontainers import SortedList
+from sortedcontainers import SortedList, SortedKeyList
 from itertools import chain
+from bisect import bisect_left, bisect_right
+from operator import neg
 import pytest
 
 
@@ -582,6 +584,276 @@ def test_eq():
     assert this == list(range(10))
     assert this == tuple(range(10))
     assert not (this == list(range(9)))
+
+
+def check_split_result(slt, expected):
+    assert list(slt) == expected
+    assert len(slt) == len(expected)
+
+    for pos, value in enumerate(expected):
+        assert slt[pos] == value
+        assert slt[pos - len(expected)] == value
+        assert slt.index(value) == bisect_left(expected, value)
+
+    if expected:
+        values = range(expected[0] - 1, expected[-1] + 2)
+    else:
+        values = ()
+
+    for value in values:
+        assert slt.bisect_left(value) == bisect_left(expected, value)
+        assert slt.bisect_right(value) == bisect_right(expected, value)
+        assert slt.count(value) == expected.count(value)
+
+    # Check invariants after the positional index has been built by the
+    # indexing and bisect operations above.
+
+    slt._check()
+
+
+def test_split():
+    random.seed(0)
+    values = [random.randrange(20) for _ in range(100)]
+    reference = sorted(values)
+
+    for index in range(len(reference) + 1):
+        slt = SortedList(values)
+        slt._reset(4)
+        assert len(slt._lists) > 4
+
+        left, right = slt.split(index)
+
+        # Original sorted list is consumed.
+
+        assert list(slt) == []
+        assert len(slt) == 0
+        slt._check()
+
+        assert list(left) == reference[:index]
+        assert list(right) == reference[index:]
+        assert left._load == 4
+        assert right._load == 4
+        left._check()
+        right._check()
+
+        # Results share no mutable sublists with each other.
+
+        left_ids = set(map(id, left._lists))
+        right_ids = set(map(id, right._lists))
+        assert not (left_ids & right_ids)
+
+        # Results are independent: mutating one does not affect the
+        # other.
+
+        left.add(-1)
+        right.add(20)
+        assert list(left) == sorted(reference[:index] + [-1])
+        assert list(right) == sorted(reference[index:] + [20])
+        left._check()
+        right._check()
+
+
+def test_split_indexing():
+    random.seed(0)
+    values = [random.randrange(10) for _ in range(50)]
+    reference = sorted(values)
+
+    # Split within a sublist, at sublist boundaries, and at the head and
+    # tail of the sorted list.
+
+    for index in (0, 1, 3, 4, 5, 8, 25, 44, 45, 48, 49, 50):
+        slt = SortedList(values)
+        slt._reset(4)
+        left, right = slt.split(index)
+        check_split_result(left, reference[:index])
+        check_split_result(right, reference[index:])
+
+
+def test_split_negative():
+    slt = SortedList(range(10))
+    slt._reset(4)
+    left, right = slt.split(-3)
+    assert list(left) == list(range(7))
+    assert list(right) == [7, 8, 9]
+    left._check()
+    right._check()
+
+
+def test_split_indexerror():
+    slt = SortedList(range(10))
+
+    with pytest.raises(IndexError):
+        slt.split(11)
+
+    with pytest.raises(IndexError):
+        slt.split(-11)
+
+    assert list(slt) == list(range(10))
+    slt._check()
+
+
+def test_split_empty():
+    slt = SortedList()
+    left, right = slt.split(0)
+    assert list(left) == []
+    assert list(right) == []
+    left._check()
+    right._check()
+
+
+def test_split_boundary_resplit():
+    # Split so that the first sublist of the right part is undersized
+    # and merging it with its successor exceeds double the load factor.
+
+    slt = SortedList(range(20))
+    slt._reset(8)
+    slt._load = 4
+
+    left, right = slt.split(7)
+
+    assert list(left) == list(range(7))
+    assert list(right) == list(range(7, 20))
+    left._check()
+    right._check()
+
+
+def test_join():
+    random.seed(0)
+    values = [random.randrange(20) for _ in range(100)]
+    reference = sorted(values)
+
+    for index in range(len(reference) + 1):
+        slt = SortedList(values)
+        slt._reset(4)
+        left, right = slt.split(index)
+
+        left.join(right)
+
+        # Joining reassembles the original sorted list and consumes the
+        # argument.
+
+        assert list(left) == reference
+        assert list(right) == []
+        left._check()
+        right._check()
+
+
+def test_join_empty():
+    slt = SortedList(range(10))
+    slt._reset(4)
+
+    # Joining into an empty sorted list adopts the load factor.
+
+    that = SortedList()
+    that.join(slt)
+    assert list(that) == list(range(10))
+    assert that._load == 4
+    that._check()
+    assert list(slt) == []
+    slt._check()
+
+    # Joining an empty sorted list is a no-op.
+
+    that.join(SortedList())
+    assert list(that) == list(range(10))
+    that._check()
+
+    empty = SortedList()
+    empty.join(SortedList())
+    assert list(empty) == []
+    empty._check()
+
+
+def test_join_different_loads():
+    this = SortedList(range(10))
+    this._reset(4)
+    that = SortedList(range(10, 31))
+    that._reset(8)
+
+    this.join(that)
+
+    assert list(this) == list(range(31))
+    assert this._load == 4
+    this._check()
+    assert list(that) == []
+    that._check()
+
+
+def test_join_boundary_resplit():
+    # Join so that merging the undersized boundary sublists exceeds
+    # double the load factor and the merged sublist is split in two.
+
+    this = SortedList(range(1))
+    this._reset(4)
+    that = SortedList(range(1, 9))
+    that._reset(8)
+    that._load = 4
+
+    this.join(that)
+
+    assert list(this) == list(range(9))
+    this._check()
+    assert list(that) == []
+
+
+def test_join_boundary_duplicates():
+    this = SortedList([1, 2, 2])
+    that = SortedList([2, 2, 3])
+    this._reset(4)
+    that._reset(4)
+
+    this.join(that)
+
+    assert list(this) == [1, 2, 2, 2, 2, 3]
+    this._check()
+
+
+def test_join_valueerror():
+    this = SortedList([5, 6, 7])
+    that = SortedList([1, 2, 3])
+
+    with pytest.raises(ValueError):
+        this.join(that)
+
+    # Failed join leaves both sorted lists unchanged.
+
+    assert list(this) == [5, 6, 7]
+    assert list(that) == [1, 2, 3]
+    this._check()
+    that._check()
+
+
+def test_join_typeerror():
+    slt = SortedList([1, 2, 3])
+
+    with pytest.raises(TypeError):
+        slt.join([4, 5, 6])
+
+    assert list(slt) == [1, 2, 3]
+
+
+def test_join_self():
+    slt = SortedList([1, 2, 3])
+
+    with pytest.raises(ValueError):
+        slt.join(slt)
+
+    assert list(slt) == [1, 2, 3]
+    slt._check()
+
+
+def test_join_key_mismatch():
+    slt = SortedList([1, 2, 3])
+    skl = SortedKeyList([4, 5], key=neg)
+
+    with pytest.raises(ValueError):
+        slt.join(skl)
+
+    with pytest.raises(ValueError):
+        skl.join(slt)
+
+    assert list(slt) == [1, 2, 3]
+    assert list(skl) == [5, 4]
 
 
 def test_ne():

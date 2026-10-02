@@ -27,6 +27,58 @@ from reprlib import recursive_repr
 from textwrap import dedent
 
 
+def _multiset_groups(items):
+    iterator = iter(items)
+
+    try:
+        group_key, first_value = next(iterator)
+    except StopIteration:
+        return
+
+    group_values = [first_value]
+
+    for key, value in iterator:
+        if key == group_key:
+            group_values.append(value)
+        else:
+            yield group_key, group_values
+            group_key = key
+            group_values = [value]
+
+    yield group_key, group_values
+
+
+def _multiset_mark_matches(left_values, right_values):
+    left_matched = [False] * len(left_values)
+    right_matched = [False] * len(right_values)
+
+    try:
+        for value in chain(left_values, right_values):
+            hash(value)
+    except TypeError:
+        for left_pos, left_value in enumerate(left_values):
+            for right_pos, right_value in enumerate(right_values):
+                if not right_matched[right_pos] and left_value == right_value:
+                    left_matched[left_pos] = True
+                    right_matched[right_pos] = True
+                    break
+    else:
+        right_positions = {}
+
+        for pos, value in enumerate(right_values):
+            right_positions.setdefault(value, []).append(pos)
+
+        for left_pos, left_value in enumerate(left_values):
+            positions = right_positions.get(left_value)
+
+            if positions:
+                right_pos = positions.pop()
+                left_matched[left_pos] = True
+                right_matched[right_pos] = True
+
+    return left_matched, right_matched
+
+
 class SortedList(MutableSequence):
     """Sorted list is a sorted mutable sequence.
 
@@ -71,6 +123,11 @@ class SortedList(MutableSequence):
     Methods for miscellany:
 
     * :func:`SortedList.copy`
+    * :func:`SortedList.multiset_intersection`
+    * :func:`SortedList.multiset_union`
+    * :func:`SortedList.multiset_difference`
+    * :func:`SortedList.multiset_symmetric_difference`
+    * :func:`SortedList.multiset_sum`
     * :func:`SortedList.__len__`
     * :func:`SortedList.__repr__`
     * :func:`SortedList._check`
@@ -1387,6 +1444,168 @@ class SortedList(MutableSequence):
 
     __radd__ = __add__
 
+    def _multiset_check_operand(self, other):
+        if not isinstance(other, SortedList):
+            raise TypeError('multiset operations require another SortedList')
+
+        if self.key is not other.key:
+            raise TypeError('multiset operations require the same key function')
+
+    def _multiset_pairs(self):
+        for value in chain.from_iterable(self._lists):
+            yield value, value
+
+    def _multiset_groups(self):
+        return _multiset_groups(self._multiset_pairs())
+
+    def _multiset_build(self, pairs):
+        pairs = list(pairs)
+
+        if self.key is None:
+            result = self.__class__()
+        else:
+            result = self.__class__(key=self._key)
+
+        result._load = self._load
+        result._clear()
+
+        load = self._load
+
+        for pos in range(0, len(pairs), load):
+            chunk = pairs[pos : (pos + load)]
+            values = [value for key, value in chunk]
+            result._lists.append(values)
+
+            if self.key is None:
+                result._maxes.append(values[-1])
+            else:
+                keys = [key for key, value in chunk]
+                result._keys.append(keys)
+                result._maxes.append(keys[-1])
+
+        result._len = len(pairs)
+        return result
+
+    def _multiset_merge(self, other, operation):
+        self._multiset_check_operand(other)
+
+        left_groups = self._multiset_groups()
+        right_groups = other._multiset_groups()
+        end = object()
+        left_group = next(left_groups, end)
+        right_group = next(right_groups, end)
+
+        def emit(values, key):
+            for value in values:
+                yield key, value
+
+        while left_group is not end and right_group is not end:
+            left_key, left_values = left_group
+            right_key, right_values = right_group
+
+            if left_key < right_key:
+                if operation in ('difference', 'symmetric_difference', 'union', 'sum'):
+                    yield from emit(left_values, left_key)
+
+                left_group = next(left_groups, end)
+            elif right_key < left_key:
+                if operation in ('symmetric_difference', 'union', 'sum'):
+                    yield from emit(right_values, right_key)
+
+                right_group = next(right_groups, end)
+            else:
+                if operation == 'sum':
+                    yield from emit(left_values, left_key)
+                    yield from emit(right_values, right_key)
+                else:
+                    left_matched, right_matched = _multiset_mark_matches(
+                        left_values, right_values
+                    )
+
+                    if operation == 'intersection':
+                        for value, matched in zip(left_values, left_matched):
+                            if matched:
+                                yield left_key, value
+                    else:
+                        for value, matched in zip(left_values, left_matched):
+                            if operation == 'union' or not matched:
+                                yield left_key, value
+
+                        if operation in ('union', 'symmetric_difference'):
+                            for value, matched in zip(right_values, right_matched):
+                                if not matched:
+                                    yield right_key, value
+
+                left_group = next(left_groups, end)
+                right_group = next(right_groups, end)
+
+        if operation in ('difference', 'symmetric_difference', 'union', 'sum'):
+            while left_group is not end:
+                left_key, left_values = left_group
+                yield from emit(left_values, left_key)
+                left_group = next(left_groups, end)
+
+        if operation in ('symmetric_difference', 'union', 'sum'):
+            while right_group is not end:
+                right_key, right_values = right_group
+                yield from emit(right_values, right_key)
+                right_group = next(right_groups, end)
+
+    def multiset_intersection(self, other):
+        """Return the minimum count of each value in both lists.
+
+        Runtime complexity: `O(n+m)`
+
+        Values are matched by equality, not sort-key equality.
+
+        """
+        return self._multiset_build(self._multiset_merge(other, 'intersection'))
+
+    def multiset_union(self, other):
+        """Return values in either list, retaining the larger count per value.
+
+        This multiset union uses maximum counts, not addition. Use
+        :func:`multiset_sum` when matching counts should be added.
+
+        Runtime complexity: `O(n+m)`
+
+        Values are matched by equality, not sort-key equality.
+
+        """
+        return self._multiset_build(self._multiset_merge(other, 'union'))
+
+    def multiset_difference(self, other):
+        """Return values in this list after subtracting matching counts.
+
+        Runtime complexity: `O(n+m)`
+
+        Values are matched by equality, not sort-key equality.
+
+        """
+        return self._multiset_build(self._multiset_merge(other, 'difference'))
+
+    def multiset_symmetric_difference(self, other):
+        """Return values with an absolute difference in their counts.
+
+        Runtime complexity: `O(n+m)`
+
+        Values are matched by equality, not sort-key equality.
+
+        """
+        return self._multiset_build(
+            self._multiset_merge(other, 'symmetric_difference')
+        )
+
+    def multiset_sum(self, other):
+        """Return both lists' values, adding the count of each value.
+
+        Runtime complexity: `O(n+m)`
+
+        Values are matched by equality, not sort-key equality.
+
+        """
+        return self._multiset_build(self._multiset_merge(other, 'sum'))
+
     def __iadd__(self, other):
         """Update sorted list with values from `other`.
 
@@ -1606,6 +1825,11 @@ class SortedKeyList(SortedList):
     * :func:`SortedKeyList.bisect_key_left`
     * :func:`SortedKeyList.bisect_key_right`
     * :func:`SortedKeyList.irange_key`
+    * :func:`SortedKeyList.multiset_intersection`
+    * :func:`SortedKeyList.multiset_union`
+    * :func:`SortedKeyList.multiset_difference`
+    * :func:`SortedKeyList.multiset_symmetric_difference`
+    * :func:`SortedKeyList.multiset_sum`
 
     Some examples below use:
 
@@ -2407,6 +2631,11 @@ class SortedKeyList(SortedList):
         return self.__class__(values, key=self._key)
 
     __radd__ = __add__
+
+    def _multiset_pairs(self):
+        for keys, values in zip(self._keys, self._lists):
+            for key, value in zip(keys, values):
+                yield key, value
 
     def __mul__(self, num):
         """Return new sorted-key list with `num` shallow copies of values.

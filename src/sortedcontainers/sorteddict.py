@@ -47,6 +47,10 @@ class SortedDict(dict):
     * :func:`SortedDict.setdefault`
     * :func:`SortedDict.update`
 
+    Methods for batch editing:
+
+    * :func:`SortedDict.batch_update`
+
     Methods for removing items:
 
     * :func:`SortedDict.clear`
@@ -137,12 +141,24 @@ class SortedDict(dict):
         else:
             _key = self._key = None
 
-        self._list = SortedList(key=_key)
-
         # Reaching through ``self._list`` repeatedly adds unnecessary overhead
-        # so cache references to sorted list methods.
+        # so cache references to sorted list methods. Some sorted list
+        # methods are also exposed publicly.
 
-        _list = self._list
+        self._set_list(SortedList(key=_key))
+
+        self._update(*args, **kwargs)
+
+    def _set_list(self, _list):
+        """Swap the sorted key list and re-cache its bound methods.
+
+        Used by :func:`SortedDict.__init__` and :func:`SortedDict.batch_update`
+        to install a fully-built sorted key list.
+
+        :param _list: sorted list of keys
+
+        """
+        self._list = _list
         self._list_add = _list.add
         self._list_clear = _list.clear
         self._list_iter = _list.__iter__
@@ -161,13 +177,11 @@ class SortedDict(dict):
         self.islice = _list.islice
         self._reset = _list._reset
 
-        if _key is not None:
+        if self._key is not None:
             self.bisect_key_left = _list.bisect_key_left
             self.bisect_key_right = _list.bisect_key_right
             self.bisect_key = _list.bisect_key
             self.irange_key = _list.irange_key
-
-        self._update(*args, **kwargs)
 
     @property
     def key(self):
@@ -516,6 +530,100 @@ class SortedDict(dict):
                 self._setitem(key, pairs[key])
 
     _update = update
+
+    def batch_update(self, operations):
+        """Apply a batch of edits to the sorted dict atomically.
+
+        The `operations` argument is an iterable of operation tuples which
+        are applied in order:
+
+        * ``('add', key, value)`` -- insert item; an existing item with the
+          same key is overwritten
+        * ``('replace', key, value)`` -- synonym for ``'add'``; a missing
+          key is inserted
+        * ``('remove', key)`` -- remove item with `key`; removing a key
+          that is not present is a no-op
+
+        Edge-case semantics:
+
+        * Duplicate operations on the same key are applied in order and the
+          last operation wins: ``('add', 'a', 1)`` followed by
+          ``('remove', 'a')`` deletes the key, while the reverse order
+          stores ``('a', 1)``.
+        * Overwriting an existing key with ``'add'`` or ``'replace'`` keeps
+          its sorted position; only the stored value changes.
+        * Removing a missing key is silently ignored, like
+          :func:`SortedList.discard`.
+
+        The batch is all-or-nothing. All key-function calls and comparisons
+        run while the new sorted key list and item table are built on the
+        side. If any operation raises -- for example a comparison or the
+        key-function fails, or an operation tuple is malformed -- then the
+        exception propagates and the sorted dict is left exactly as it was:
+        the dict items, the sorted key list blocks (``_lists``), the maxes
+        index (``_maxes``) and the positional index (``_index``) are all
+        untouched.
+
+        On success the new structure is committed in one step: the internal
+        sorted key list is swapped for the fully-built replacement and the
+        dict items are replaced. The commit runs no user code: no key
+        function, comparison, or hash is invoked while committing.
+
+        The batch is *not* thread-safe: no lock is held and concurrent
+        readers may observe the commit in progress. Use external
+        synchronization to serialize batches against readers.
+
+        Views returned by :func:`SortedDict.keys`, :func:`SortedDict.items`
+        and :func:`SortedDict.values` are live: after a successful commit
+        they reflect the new items. Iterators created before the commit
+        keep iterating the previous key list and do not observe the batch.
+        Do not run a batch concurrently with iteration from another thread.
+
+        Runtime complexity: `O(n + k*log(n))` -- approximate, for `k`
+        operations on a sorted dict of size `n`.
+
+        >>> sd = SortedDict({'a': 1, 'b': 2, 'c': 3})
+        >>> sd.batch_update([('remove', 'a'), ('add', 'd', 4), ('replace', 'b', 20)])
+        >>> sd
+        SortedDict({'b': 20, 'c': 3, 'd': 4})
+        >>> sd.batch_update([('remove', 'zz'), ('add', 'b', -1)])
+        >>> sd
+        SortedDict({'b': -1, 'c': 3, 'd': 4})
+        >>> sd.batch_update([('add', 'e', 5), ('frobnicate', 'x')])
+        Traceback (most recent call last):
+          ...
+        ValueError: unknown batch update operation: 'frobnicate'
+        >>> sd
+        SortedDict({'b': -1, 'c': 3, 'd': 4})
+
+        :param operations: iterable of operation tuples
+        :raises ValueError: if an operation is unknown or malformed
+
+        """
+        keys = self._list.copy()
+        items = dict.copy(self)
+
+        for operation in operations:
+            kind = operation[0]
+            if kind == 'remove':
+                _, key = operation
+                if key in items:
+                    del items[key]
+                    keys.remove(key)
+            elif kind == 'add' or kind == 'replace':
+                _, key, value = operation
+                if key not in items:
+                    keys.add(key)
+                items[key] = value
+            else:
+                raise ValueError(f'unknown batch update operation: {kind!r}')
+
+        # Commit: swap in the fully-built structures. No user code runs
+        # below, so the commit cannot fail partway through.
+
+        self._set_list(keys)
+        dict.clear(self)
+        dict.update(self, items)
 
     def __reduce__(self):
         """Support for pickle.

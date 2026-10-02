@@ -16,6 +16,7 @@ SortedDict
    .. automethod:: __len__
    .. automethod:: setdefault
    .. automethod:: update
+   .. automethod:: batch_update
    .. automethod:: clear
    .. automethod:: pop
    .. automethod:: popitem

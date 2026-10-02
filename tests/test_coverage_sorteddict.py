@@ -582,3 +582,171 @@ def test_ior():
     temp2 = SortedDict(mapping[13:])
     temp1 |= temp2
     assert temp1 == dict(mapping)
+
+
+def snapshot_internals(sd):
+    """Capture the member table and sorted key list internals of `sd`."""
+    _list = sd._list
+    return {
+        'items': dict.copy(sd),
+        'list_id': id(_list),
+        'lists': [list(sublist) for sublist in _list._lists],
+        'maxes': list(_list._maxes),
+        'index': list(_list._index),
+        'len': _list._len,
+    }
+
+
+def assert_internals_unchanged(sd, snapshot):
+    _list = sd._list
+    assert dict.copy(sd) == snapshot['items']
+    assert id(_list) == snapshot['list_id']
+    assert _list._lists == snapshot['lists']
+    assert _list._maxes == snapshot['maxes']
+    assert _list._index == snapshot['index']
+    assert _list._len == snapshot['len']
+    sd._check()
+
+
+def test_batch_update():
+    temp = SortedDict({'a': 1, 'b': 2, 'c': 3})
+    temp.batch_update(
+        [
+            ('add', 'd', 4),  # insert new key
+            ('replace', 'a', 10),  # overwrite existing key
+            ('add', 'b', 20),  # add also overwrites existing key
+            ('remove', 'c'),  # remove existing key
+            ('remove', 'zz'),  # remove missing key: no-op
+            ('add', 'e', 5),
+            ('remove', 'e'),  # add then remove: key is gone
+            ('remove', 'b'),
+            ('add', 'b', 200),  # remove then add: last operation wins
+            ('replace', 'f', 60),  # replace of missing key inserts
+        ]
+    )
+    assert dict(temp) == {'a': 10, 'b': 200, 'd': 4, 'f': 60}
+    assert list(temp) == ['a', 'b', 'd', 'f']
+    temp._check()
+
+
+def test_batch_update_empty():
+    temp = SortedDict({'a': 1})
+    temp.batch_update([])
+    assert dict(temp) == {'a': 1}
+    temp._check()
+
+
+def test_batch_update_unknown_operation():
+    temp = SortedDict({'a': 1})
+    before = snapshot_internals(temp)
+    with pytest.raises(ValueError):
+        temp.batch_update([('add', 'b', 2), ('frobnicate', 'a')])
+    assert_internals_unchanged(temp, before)
+
+
+def test_batch_update_malformed_operation():
+    temp = SortedDict({'a': 1})
+    before = snapshot_internals(temp)
+    with pytest.raises(ValueError):
+        temp.batch_update([('add', 'b')])  # too few values to unpack
+    assert_internals_unchanged(temp, before)
+
+
+def test_batch_update_views_and_iterators():
+    temp = SortedDict({'a': 1, 'b': 2})
+    keys_view = temp.keys()
+    items_view = temp.items()
+    iterator = iter(temp)
+    temp.batch_update([('add', 'c', 3), ('remove', 'a')])
+    # Views are live and reflect the committed batch.
+    assert list(keys_view) == ['b', 'c']
+    assert list(items_view) == [('b', 2), ('c', 3)]
+    # Iterators created before the commit see the previous key list.
+    assert list(iterator) == ['a', 'b']
+    temp._check()
+
+
+class PoisonKey:
+    """Key whose comparisons raise once the poisoned key is involved."""
+
+    def __init__(self, value, poison=False):
+        self.value = value
+        self.poison = poison
+
+    def __lt__(self, other):
+        if self.poison or other.poison:
+            raise RuntimeError('comparison failed')
+        return self.value < other.value
+
+    def __le__(self, other):
+        if self.poison or other.poison:
+            raise RuntimeError('comparison failed')
+        return self.value <= other.value
+
+    def __eq__(self, other):
+        return self.value == other.value
+
+    def __hash__(self):
+        return hash(self.value)
+
+
+def test_batch_update_comparison_failure_then_retry():
+    keys = [PoisonKey(num) for num in range(20)]
+    temp = SortedDict((key, key.value) for key in keys)
+    temp._check()
+    before = snapshot_internals(temp)
+
+    # The poisoned key raises mid-batch, after earlier operations succeed.
+    with pytest.raises(RuntimeError):
+        temp.batch_update(
+            [
+                ('add', PoisonKey(100), 100),
+                ('remove', keys[3]),
+                ('add', PoisonKey(101, poison=True), 101),
+                ('add', PoisonKey(102), 102),
+            ]
+        )
+
+    # Members and internal indexes are identical to before the batch.
+    assert_internals_unchanged(temp, before)
+
+    # A subsequent well-formed batch commits successfully.
+    temp.batch_update(
+        [
+            ('add', PoisonKey(100), 100),
+            ('remove', keys[3]),
+            ('replace', keys[5], 500),
+        ]
+    )
+    assert len(temp) == 20
+    assert keys[3] not in temp
+    assert temp[keys[5]] == 500
+    assert temp[PoisonKey(100)] == 100
+    # Cached sorted list methods were re-bound to the committed key list.
+    assert temp.index(PoisonKey(100)) == 19
+    assert list(temp.islice(18, 20)) == [keys[19], PoisonKey(100)]
+    temp._check()
+
+
+def test_batch_update_key_function_failure_then_retry():
+    def keyfunc(value):
+        if value == 13:
+            raise RuntimeError('key function failed')
+        return -value
+
+    temp = SortedDict(keyfunc, [(num, num * num) for num in range(10)])
+    temp._check()
+    before = snapshot_internals(temp)
+
+    with pytest.raises(RuntimeError):
+        temp.batch_update([('add', 10, 100), ('add', 13, 169)])
+
+    assert_internals_unchanged(temp, before)
+
+    temp.batch_update([('add', 10, 100), ('remove', 0), ('replace', 5, 55)])
+    assert len(temp) == 10
+    assert 0 not in temp
+    assert temp[10] == 100
+    assert temp[5] == 55
+    assert temp.bisect_key(-10) == 1
+    temp._check()

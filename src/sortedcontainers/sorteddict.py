@@ -10,6 +10,7 @@ Sorted dict implementations:
 .. currentmodule:: sortedcontainers
 
 * :class:`SortedDict`
+* :class:`AggregateSortedDict`
 * :class:`SortedKeysView`
 * :class:`SortedItemsView`
 * :class:`SortedValuesView`
@@ -17,11 +18,21 @@ Sorted dict implementations:
 """
 
 import warnings
+from bisect import bisect_left, bisect_right
 from collections.abc import ItemsView, KeysView, Mapping, Sequence, ValuesView
 from itertools import chain
 
 from .sortedlist import SortedList, recursive_repr
 from .sortedset import SortedSet
+
+
+class _Stale:
+    # pylint: disable=too-few-public-methods
+    def __repr__(self):
+        return '<stale>'
+
+
+_STALE = _Stale()
 
 
 class SortedDict(dict):
@@ -638,6 +649,177 @@ class SortedKeysView(KeysView, Sequence):
         return self._mapping._list[index]
 
     __delitem__ = _view_delitem
+
+
+def _agg_pass(value):
+    # Default value function: use the stored value as the aggregate element.
+    return value
+
+
+class AggregateSortedDict(SortedDict):
+    """Sorted dict with optional range-aggregate queries.
+
+    An aggregate sorted dict is a sorted mutable mapping that maintains
+    per-block aggregate summaries over its values. The summaries reuse the
+    block structure of the underlying sorted list of keys. Range queries
+    combine the summaries of the blocks they cover and expand only the two
+    boundary blocks element-wise.
+
+    Aggregation is configured with three caller-provided pieces:
+
+    * `identity`: the identity element of the aggregate, or a zero-argument
+      callable returning a fresh identity element. The identity is the
+      result of an empty range.
+    * `combine`: an associative binary function combining two aggregate
+      elements. It need not be commutative and no inverse is required.
+    * `value`: an optional function mapping each stored value to an
+      aggregate element. Defaults to the identity function.
+
+    Because only associativity is assumed, updates never subtract old
+    contributions: the summaries of affected blocks are recomputed lazily
+    from the block contents.
+
+    User-provided functions are only called during queries, never during
+    mutation. If a user function raises an exception, the mapping and its
+    summaries are left in a consistent state: no key-value pair is changed
+    without its block summary being recomputed.
+
+    Without `combine`, the aggregate sorted dict behaves exactly like a
+    sorted dict and maintains no summaries.
+
+    >>> from operator import add
+    >>> from sortedcontainers import AggregateSortedDict
+    >>> sd = AggregateSortedDict(identity=0, combine=add)
+    >>> sd.update({'a': 1, 'b': 2, 'c': 3})
+    >>> sd.aggregate()
+    6
+    >>> sd.aggregate('b', 'c')
+    5
+    >>> sd['b'] = 10
+    >>> sd.aggregate()
+    14
+
+    """
+
+    def __init__(self, *args, **kwargs):
+        """Initialize aggregate sorted dict instance.
+
+        Optional keyword arguments configure aggregation:
+
+        * `identity`: identity element, or zero-argument callable returning
+          a fresh identity element.
+        * `combine`: associative binary combine function.
+        * `value`: function mapping stored values to aggregate elements.
+
+        Remaining arguments are forwarded to :class:`SortedDict`.
+
+        >>> from operator import add
+        >>> from sortedcontainers import AggregateSortedDict
+        >>> sd = AggregateSortedDict(identity=0, combine=add)
+        >>> sd.aggregate()
+        0
+
+        """
+        self._agg_identity = kwargs.pop('identity', None)
+        self._agg_combine = kwargs.pop('combine', None)
+        self._agg_value = kwargs.pop('value', None)
+        self._agg_on = self._agg_combine is not None
+        if self._agg_on and self._agg_identity is None:
+            raise ValueError('identity is required when combine is given')
+        self._sums = []
+        self._sums_len = 0
+        self._sums_load = None
+        super().__init__(*args, **kwargs)
+
+    def _agg_ident(self):
+        # Return the identity element, calling it when it is a factory.
+        identity = self._agg_identity
+        return identity() if callable(identity) else identity
+
+    def _agg_sync(self):
+        # Reconcile summary bookkeeping with the sorted list of keys. Any
+        # mutation that bypassed the hooks below is caught here by comparing
+        # lengths and the load factor; a mismatch invalidates all summaries.
+        _list = self._list
+        if (
+            self._sums_len != _list._len
+            or self._sums_load != _list._load
+            or len(self._sums) != len(_list._lists)
+        ):
+            self._agg_reset()
+
+    def _agg_reset(self):
+        # Mark every block summary stale.
+        _list = self._list
+        self._sums = [_STALE] * len(_list._lists)
+        self._sums_len = _list._len
+        self._sums_load = _list._load
+
+    def _agg_locate(self, key):
+        # Return the index of the block containing `key`. `key` must exist.
+        _list = self._list
+        _maxes = _list._maxes
+        _key = self._key
+        if _key is None:
+            return bisect_left(_maxes, key)
+        max_key = _key(key)
+        pos = bisect_left(_maxes, max_key)
+        _lists = _list._lists
+        _keys = _list._keys
+        idx = bisect_left(_keys[pos], max_key)
+        len_keys = len(_keys)
+        len_sublist = len(_keys[pos])
+        while True:
+            if _lists[pos][idx] == key:
+                return pos
+            idx += 1
+            if idx == len_sublist:
+                pos += 1
+                if pos == len_keys:
+                    raise KeyError(key)
+                len_sublist = len(_keys[pos])
+                idx = 0
+
+    def _agg_block(self, pos):
+        # Return the summary of block `pos`, recomputing it when stale.
+        # User functions are called here, during queries, never during
+        # mutation. If they raise, the stale marker is left in place.
+        sums = self._sums
+        summary = sums[pos]
+        if summary is not _STALE:
+            return summary
+        value = self._agg_value
+        if value is None:
+            value = _agg_pass
+        combine = self._agg_combine
+        get = dict.__getitem__
+        acc = self._agg_ident()
+        for key in self._list._lists[pos]:
+            acc = combine(acc, value(get(self, key)))
+        sums[pos] = acc
+        return acc
+
+    def _agg_add_key(self, key):
+        # Insert `key` into the sorted list and invalidate the summaries of
+        # the blocks that changed. `key` must not be present.
+        self._agg_sync()
+        _list = self._list
+        _maxes = _list._maxes
+        old_blocks = len(_maxes)
+        if not old_blocks:
+            self._list_add(key)
+            self._sums = [_STALE]
+            self._sums_len = _list._len
+            return
+        _key = self._key
+        max_key = key if _key is None else _key(key)
+        pos = 0
+        if _maxes:
+            pos = 1
+            if max_key <= _maxes[-1]:
+                pos = 1
+        self._list_add(key)
+        return
 
 
 class SortedItemsView(ItemsView, Sequence):

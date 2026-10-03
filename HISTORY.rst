@@ -7,6 +7,18 @@ Sorted Containers Release History
 
 .. currentmodule:: sortedcontainers
 
+Unreleased
+----------
+
+**API Changes**
+
+* Add :func:`SortedKeyList.cursor` and :class:`SortedKeyListCursor` for
+  enforced-consistent pagination across the same sort key.
+  The cursor tracks an exact position within a run of equal keys,
+  keeps no snapshot of the list, and adjusts as items are added or
+  removed. Iterating an invalid cursor raises
+  :exc:`CursorInvalidError`.
+
 2.4.0 (2021-05-16)
 ------------------
 

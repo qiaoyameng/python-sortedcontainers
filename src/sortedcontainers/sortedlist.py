@@ -25,6 +25,7 @@ from math import log
 from operator import add, eq, ge, gt, iadd, le, lt, ne
 from reprlib import recursive_repr
 from textwrap import dedent
+from weakref import WeakSet
 
 
 class SortedList(MutableSequence):
@@ -718,7 +719,9 @@ class SortedList(MutableSequence):
             if step == 1 and start < stop:
                 if start == 0 and stop == self._len:
                     return self._clear()
-                elif self._len <= 8 * (stop - start):
+                elif self._len <= 8 * (stop - start) and not getattr(
+                    self, '_cursors', None
+                ):
                     values = self._getitem(slice(None, start))
                     if stop < self._len:
                         values += self._getitem(slice(stop, None))
@@ -1591,6 +1594,17 @@ def identity(value):
     return value
 
 
+class CursorInvalidError(RuntimeError):
+    """Cursor can no longer guarantee its position in the sorted-key list.
+
+    Raised when iterating a :class:`SortedKeyListCursor` whose position can
+    no longer be maintained because the sorted-key list was rebuilt by a
+    bulk operation like :func:`SortedKeyList.clear`, :func:`SortedList._reset`
+    or ``*=``.
+
+    """
+
+
 class SortedKeyList(SortedList):
     """Sorted-key list is a subtype of sorted list.
 
@@ -1605,6 +1619,7 @@ class SortedKeyList(SortedList):
     * :attr:`SortedKeyList.key`
     * :func:`SortedKeyList.bisect_key_left`
     * :func:`SortedKeyList.bisect_key_right`
+    * :func:`SortedKeyList.cursor`
     * :func:`SortedKeyList.irange_key`
 
     Some examples below use:
@@ -1642,6 +1657,7 @@ class SortedKeyList(SortedList):
 
         """
         self._key = key
+        self._cursors = WeakSet()
         self._len = 0
         self._load = self.DEFAULT_LOAD_FACTOR
         self._lists = []
@@ -1672,6 +1688,9 @@ class SortedKeyList(SortedList):
         del self._keys[:]
         del self._maxes[:]
         del self._index[:]
+
+        for cursor in self._cursors:
+            cursor._valid = False
 
     _clear = clear
 
@@ -1717,6 +1736,14 @@ class SortedKeyList(SortedList):
             _maxes.append(key)
 
         self._len += 1
+
+        if self._cursors:
+            # The new value is stored last in its key run. Notify cursors so
+            # that positions after the insertion point shift forward.
+            index = self._bisect_key_right(key) - 1
+            for cursor in self._cursors:
+                if cursor._index > index:
+                    cursor._index += 1
 
     def _expand(self, pos):
         """Split sublists with length greater than double the load-factor.
@@ -1776,7 +1803,7 @@ class SortedKeyList(SortedList):
         values = sorted(iterable, key=self._key)
 
         if _maxes:
-            if len(values) * 4 >= self._len:
+            if len(values) * 4 >= self._len and not self._cursors:
                 _lists.append(values)
                 values = reduce(iadd, _lists, [])
                 values.sort(key=self._key)
@@ -1960,6 +1987,13 @@ class SortedKeyList(SortedList):
         :param int idx: sublist index
 
         """
+        _cursors = self._cursors
+
+        # Compute the flat index before mutating so cursors can be adjusted
+        # to account for the deleted value.
+
+        index = self._loc(pos, idx) if _cursors else None
+
         _lists = self._lists
         _keys = self._keys
         _maxes = self._maxes
@@ -2004,6 +2038,11 @@ class SortedKeyList(SortedList):
             del _keys[pos]
             del _maxes[pos]
             del _index[:]
+
+        if index is not None:
+            for cursor in _cursors:
+                if cursor._index > index:
+                    cursor._index -= 1
 
     def irange(self, minimum=None, maximum=None, inclusive=(True, True), reverse=False):
         """Create an iterator of values between `minimum` and `maximum`.
@@ -2126,6 +2165,100 @@ class SortedKeyList(SortedList):
         return self._islice(min_pos, min_idx, max_pos, max_idx, reverse)
 
     _irange_key = irange_key
+
+    def cursor(self, after=None, before=None):
+        """Create a cursor view over the sorted-key list.
+
+        A cursor marks a position between values in the sorted-key list so
+        that pages of values may be fetched reliably, even when many values
+        share the same sort key. Unlike a bookmark that records only the
+        last key of a page, the cursor tracks an exact position within a run
+        of equal keys.
+
+        With neither `after` nor `before`, the cursor is positioned at the
+        start of the sorted-key list. Given `after`, the cursor is
+        positioned immediately after the first occurrence of `after` found
+        by identity. Given `before`, the cursor is positioned immediately
+        before the first occurrence of `before` found by identity. Only one
+        of `after` and `before` may be given.
+
+        Iterating the cursor yields values from its position forward and
+        advances the cursor past each yielded value. Reversing the cursor
+        yields values before its position in reverse order and moves the
+        cursor before each yielded value. Use :func:`itertools.islice` to
+        fetch a page of values:
+
+        >>> from itertools import islice
+        >>> from operator import neg
+        >>> skl = SortedKeyList([5, 4, 4, 3, 2, 2, 2, 1], key=neg)
+        >>> cursor = skl.cursor()
+        >>> list(islice(cursor, 3))
+        [5, 4, 4]
+        >>> list(islice(cursor, 3))
+        [3, 2, 2]
+        >>> list(islice(cursor, 3))
+        [2, 1]
+        >>> list(islice(cursor, 3))
+        []
+
+        The cursor is a live view: it holds no snapshot of the sorted-key
+        list and never serializes values. The position is adjusted as values
+        are added or removed. Deleting the most recently yielded value does
+        not disturb the position:
+
+        >>> cursor = skl.cursor(after=skl[0])
+        >>> skl.discard(5)
+        >>> list(islice(cursor, 2))
+        [4, 4]
+
+        Reverse iteration is supported too:
+
+        >>> cursor = skl.cursor(after=skl[-1])
+        >>> list(islice(reversed(cursor), 3))
+        [1, 2, 2]
+
+        Bulk operations that rebuild the sorted-key list invalidate the
+        cursor. See :class:`SortedKeyListCursor` for the full contract:
+
+        >>> skl.clear()
+        >>> list(cursor)
+        Traceback (most recent call last):
+          ...
+        sortedcontainers.sortedlist.CursorInvalidError: cursor position is no longer valid
+
+        :param after: value to position the cursor after (optional)
+        :param before: value to position the cursor before (optional)
+        :return: cursor view
+        :raises ValueError: if both `after` and `before` are given, or the
+            given value is not present in the sorted-key list
+
+        """
+        if after is not None and before is not None:
+            raise ValueError('only one of `after` and `before` may be given')
+
+        if after is not None:
+            return SortedKeyListCursor(self, self._cursor_locate(after) + 1)
+
+        if before is not None:
+            return SortedKeyListCursor(self, self._cursor_locate(before))
+
+        return SortedKeyListCursor(self, 0)
+
+    def _cursor_locate(self, value):
+        """Return the flat index of the first occurrence of `value`, found by
+        identity within its key run. Raise ValueError if `value` is not
+        present.
+
+        """
+        key = self._key(value)
+        start = self._bisect_key_left(key)
+        stop = self._bisect_key_right(key)
+
+        for index, item in enumerate(self.islice(start, stop), start):
+            if item is value:
+                return index
+
+        raise ValueError(f'{value!r} is not in list')
 
     def bisect_left(self, value):
         """Return an index to insert `value` in the sorted-key list.
@@ -2527,3 +2660,122 @@ class SortedKeyList(SortedList):
 
 
 SortedListWithKey = SortedKeyList
+
+
+class SortedKeyListCursor:
+    """Cursor view over a sorted-key list for stable pagination.
+
+    Create cursors with :func:`SortedKeyList.cursor`. A cursor marks a
+    position *between* values in the sorted-key list so that pages of values
+    may be fetched reliably, even when many values share the same sort key.
+
+    The cursor is a live view: it references the sorted-key list and holds
+    no snapshot of its contents. Values are never serialized; the position
+    is tracked as a flat index and adjusted as the list is mutated.
+
+    The position remains valid as values are added or removed:
+
+    * Adding values with ``add``, ``update`` or ``+=`` shifts the cursor
+      forward when values are inserted before it. Values inserted after the
+      cursor, including new values with the same sort key as neighboring
+      values, will be yielded by forward iteration.
+    * Removing values with ``discard``, ``remove``, ``pop`` or ``del``
+      (including slices) shifts the cursor back when values before it are
+      deleted. Deleting the most recently yielded value does not disturb
+      the position: the next value yielded is the one that follows the
+      deletion.
+
+    Bulk operations that rebuild the sorted-key list invalidate the cursor:
+    ``clear``, ``_reset``, ``*=``, and deleting the whole list with
+    ``del skl[:]``. Iterating an invalid cursor raises
+    :exc:`CursorInvalidError`.
+
+    Mutating the sorted-key list while iterating a cursor is not supported,
+    matching the semantics of the sorted-key list's own iterators.
+
+    """
+
+    def __init__(self, skl, index=0):
+        self._skl = skl
+        self._index = index
+        self._valid = True
+        skl._cursors.add(self)
+
+    def _check_valid(self):
+        if not self._valid:
+            raise CursorInvalidError('cursor position is no longer valid')
+
+    @property
+    def index(self):
+        "Flat position of the cursor in the sorted-key list."
+        return self._index
+
+    def __iter__(self):
+        """Yield values from the cursor position forward.
+
+        Each yielded value advances the cursor past that value, so
+        successive iterations continue where the previous one stopped.
+
+        :return: iterator
+        :raises CursorInvalidError: if the cursor position is no longer
+            valid
+
+        """
+        self._check_valid()
+
+        skl = self._skl
+        index = self._index
+
+        if index >= skl._len:
+            return
+
+        pos, idx = skl._pos(index)
+        _lists = skl._lists
+        len_lists = len(_lists)
+
+        while pos < len_lists:
+            sublist = _lists[pos]
+            while idx < len(sublist):
+                self._index = index + 1
+                yield sublist[idx]
+                idx += 1
+                index += 1
+            pos += 1
+            idx = 0
+
+    def __reversed__(self):
+        """Yield values before the cursor position in reverse order.
+
+        Each yielded value moves the cursor before that value, so
+        successive iterations continue where the previous one stopped.
+
+        :return: iterator
+        :raises CursorInvalidError: if the cursor position is no longer
+            valid
+
+        """
+        self._check_valid()
+
+        skl = self._skl
+        index = self._index - 1
+
+        if index < 0:
+            return
+
+        pos, idx = skl._pos(index)
+        _lists = skl._lists
+
+        while pos >= 0:
+            sublist = _lists[pos]
+            while idx >= 0:
+                self._index = index
+                yield sublist[idx]
+                idx -= 1
+                index -= 1
+            pos -= 1
+            if pos >= 0:
+                idx = len(_lists[pos]) - 1
+
+    def __repr__(self):
+        "Return string representation of the cursor."
+        return f'{type(self).__name__}({self._index})'

@@ -58,6 +58,19 @@ SortedKeyList
    .. autoattribute:: key
    .. automethod:: bisect_key_left
    .. automethod:: bisect_key_right
+   .. automethod:: cursor
    .. automethod:: irange_key
 
 .. autoclass:: sortedcontainers.SortedListWithKey
+
+
+SortedKeyListCursor
+...................
+
+.. autoclass:: sortedcontainers.SortedKeyListCursor
+
+   .. autoattribute:: index
+   .. automethod:: __iter__
+   .. automethod:: __reversed__
+
+.. autoexception:: sortedcontainers.CursorInvalidError

@@ -45,16 +45,18 @@ testing has 100% coverage with unit tests and hours of stress.
 
 """
 
+from .aggregation import AggregatingSortedDict
+from .sortedlist import SortedKeyList, SortedList, SortedListWithKey
 from .sorteddict import (
     SortedDict,
     SortedItemsView,
     SortedKeysView,
     SortedValuesView,
 )
-from .sortedlist import SortedKeyList, SortedList, SortedListWithKey
 from .sortedset import SortedSet
 
 __all__ = [
+    'AggregatingSortedDict',
     'SortedList',
     'SortedKeyList',
     'SortedListWithKey',

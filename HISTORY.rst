@@ -7,6 +7,16 @@ Sorted Containers Release History
 
 .. currentmodule:: sortedcontainers
 
+Unreleased
+----------
+
+**Features**
+
+* Add `SortedKeyList.cursor` returning a `SortedKeyListCursor` view that
+  pins a position within a run of equal keys for cursor-based pagination.
+  Cursors support forward and reverse iteration and raise
+  `CursorInvalidError` when their position can no longer be resolved.
+
 2.4.0 (2021-05-16)
 ------------------
 

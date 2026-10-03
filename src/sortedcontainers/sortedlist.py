@@ -1605,6 +1605,7 @@ class SortedKeyList(SortedList):
     * :attr:`SortedKeyList.key`
     * :func:`SortedKeyList.bisect_key_left`
     * :func:`SortedKeyList.bisect_key_right`
+    * :func:`SortedKeyList.cursor`
     * :func:`SortedKeyList.irange_key`
 
     Some examples below use:
@@ -2127,6 +2128,66 @@ class SortedKeyList(SortedList):
 
     _irange_key = irange_key
 
+    def cursor(self, after=None, end=False):
+        """Create a sorted-key list cursor view.
+
+        The cursor pins a position within the sorted-key list, including
+        positions inside a run of values with equal keys. Iterating the cursor
+        resumes exactly after (or before) the pinned value, so paginating with
+        a cursor neither skips nor repeats values when many values share the
+        same key. See :class:`SortedKeyListCursor` for the full contract.
+
+        By default the cursor is positioned before the first value so that
+        forward iteration yields all values:
+
+        >>> skl = SortedKeyList(['a1', 'b1', 'b2', 'c1'], key=lambda val: val[0])
+        >>> cursor = skl.cursor()
+        >>> cursor.next()
+        'a1'
+        >>> cursor.next()
+        'b1'
+
+        With `after`, the cursor anchors to a specific member value. The
+        anchor is resolved by identity (using ``is``) within the run of
+        values sharing the anchor's key:
+
+        >>> cursor = skl.cursor(after=skl[1])
+        >>> cursor.next()
+        'b2'
+
+        With `end` true, the cursor is positioned after the last value which
+        is useful for iterating in reverse:
+
+        >>> cursor = skl.cursor(end=True)
+        >>> cursor.prev()
+        'c1'
+
+        Runtime complexity: `O(log(n) + r)` where `r` is the length of the
+        run of values with keys equal to the anchor's key.
+
+        :param after: member value to anchor the cursor after (default None,
+            position the cursor before the first value)
+        :param bool end: position the cursor after the last value (default
+            False); may not be combined with `after`
+        :return: :class:`SortedKeyListCursor`
+        :raises ValueError: if `after` is not a member of the sorted-key list
+            or if `after` and `end` are both given
+
+        """
+        if after is None:
+            state = _CURSOR_END if end else _CURSOR_START
+            return SortedKeyListCursor(self, state)
+
+        if end:
+            raise ValueError('cursor arguments `after` and `end` are mutually exclusive')
+
+        key = self._key(after)
+
+        if _locate_value(self, after, key) is None:
+            raise ValueError(f'{after!r} not in list')
+
+        return SortedKeyListCursor(self, _CURSOR_ANCHOR, after, key)
+
     def bisect_left(self, value):
         """Return an index to insert `value` in the sorted-key list.
 
@@ -2527,3 +2588,317 @@ class SortedKeyList(SortedList):
 
 
 SortedListWithKey = SortedKeyList
+
+
+class CursorInvalidError(RuntimeError):
+    "Raised when a sorted-key list cursor can no longer be resolved."
+
+
+_CURSOR_START = 'start'
+_CURSOR_END = 'end'
+_CURSOR_ANCHOR = 'anchor'
+
+
+def _locate_value(skl, value, key):
+    """Return the index of `value` in sorted-key list `skl` or None.
+
+    The value is resolved by identity (using ``is``) within the run of
+    values with keys equal to `key`.
+
+    """
+    _maxes = skl._maxes
+
+    if not _maxes:
+        return None
+
+    pos = bisect_left(_maxes, key)
+
+    if pos == len(_maxes):
+        return None
+
+    _keys = skl._keys
+    _lists = skl._lists
+    idx = bisect_left(_keys[pos], key)
+    len_keys = len(_keys)
+    len_sublist = len(_keys[pos])
+
+    while True:
+        if _keys[pos][idx] != key:
+            return None
+        if _lists[pos][idx] is value:
+            return skl._loc(pos, idx)
+        idx += 1
+        if idx == len_sublist:
+            pos += 1
+            if pos == len_keys:
+                return None
+            len_sublist = len(_keys[pos])
+            idx = 0
+
+
+class SortedKeyListCursor:
+    """Sorted-key list cursor is an explicit cursor view over a sorted-key
+    list.
+
+    A cursor pins a position in a :class:`SortedKeyList` so that iteration
+    can be resumed later, even as values are added to or removed from the
+    list. Unlike recording only the last-seen key of a page, a cursor
+    distinguishes values within a run of equal keys and so neither skips
+    nor repeats values when paginating a list in which many values share
+    the same key.
+
+    Create cursors with :func:`SortedKeyList.cursor`. Iterate with
+    :func:`iterate`, :func:`next` and :func:`prev`.
+
+    Position model:
+
+    * The cursor anchors to a specific member *value*, resolved by identity
+      (using ``is``) within the run of values sharing the anchor's key.
+    * Forward iteration yields values strictly after the anchor; reverse
+      iteration yields values strictly before the anchor. The anchor itself
+      is not yielded again in either direction.
+    * Every yielded value becomes the new anchor, so consecutive iterations
+      continue where the previous one stopped.
+
+    Validity:
+
+    * Adding values, with any key, does not invalidate the cursor. Values
+      added with the anchor's key sort after all existing values with that
+      key and are yielded by later forward iterations.
+    * Removing values other than the anchor does not invalidate the cursor.
+    * The cursor is invalidated when the anchor value is removed, when the
+      list is cleared, or when the anchor's key changes (whether mutated in
+      place or removed and re-added under a different key). Validity is
+      determined lazily at each use: if the anchor value is re-added under
+      its recorded key, the cursor becomes valid again.
+    * When invalid, :attr:`valid` is false and :func:`iterate`,
+      :func:`next` and :func:`prev` raise :exc:`CursorInvalidError`.
+
+    The cursor stores only a reference to the list, the anchor value, and
+    the anchor's key: `O(1)` memory. It never copies the list (no snapshot)
+    and never serializes values. Resolving the anchor costs `O(log(n) + r)`
+    where `r` is the length of the anchor's equal-key run; resolution
+    happens once per :func:`iterate`, :func:`next` or :func:`prev` call.
+    Iteration itself is `O(1)` amortized per value.
+
+    Like the sorted-key list's own iterators, mutating the list during a
+    single :func:`iterate` call may cause values to be skipped or repeated;
+    the validity guarantees above apply between calls. And like the
+    sorted-key list itself, the cursor requires that the keys of all
+    *other* values remain stable while stored; changing them corrupts the
+    list and makes cursor behavior undefined.
+
+    >>> from operator import itemgetter
+    >>> records = [(1, 'a'), (1, 'b'), (1, 'c'), (2, 'd')]
+    >>> skl = SortedKeyList(records, key=itemgetter(0))
+    >>> cursor = skl.cursor()
+    >>> cursor.next()
+    (1, 'a')
+    >>> cursor.next()
+    (1, 'b')
+    >>> skl.add((1, 'x'))
+    >>> cursor.next()
+    (1, 'c')
+    >>> cursor.next()
+    (1, 'x')
+    >>> cursor.next()
+    (2, 'd')
+    >>> cursor = skl.cursor(after=skl[0])
+    >>> skl.pop(0)
+    (1, 'a')
+    >>> cursor.valid
+    False
+    >>> cursor.next()
+    Traceback (most recent call last):
+        ...
+    sortedcontainers.sortedlist.CursorInvalidError: cursor anchor is no longer a member of the sorted-key list
+
+    """
+
+    def __init__(self, skl, state, value=None, key=None):
+        "Initialize sorted-key list cursor. Use `SortedKeyList.cursor`."
+        self._skl = skl
+        self._state = state
+        self._value = value
+        self._key = key
+
+    @property
+    def valid(self):
+        """True if the cursor position can still be resolved.
+
+        The result is a snapshot: later mutations may invalidate the cursor.
+        See :class:`SortedKeyListCursor` for the validity contract.
+
+        >>> from operator import neg
+        >>> skl = SortedKeyList([1, 2, 3], key=neg)
+        >>> cursor = skl.cursor(after=skl[0])
+        >>> cursor.valid
+        True
+        >>> skl.clear()
+        >>> cursor.valid
+        False
+
+        """
+        try:
+            self._resolve()
+        except CursorInvalidError:
+            return False
+        return True
+
+    def iterate(self, reverse=False):
+        """Return an iterator yielding values after the cursor.
+
+        When `reverse` is true, yield values before the cursor in reverse
+        order. Each yielded value becomes the cursor's new anchor so that
+        consecutive iterations continue where the previous one stopped.
+
+        The cursor position is resolved eagerly, once, when `iterate` is
+        called; :exc:`CursorInvalidError` is raised immediately if the
+        cursor is invalid.
+
+        >>> from operator import neg
+        >>> skl = SortedKeyList([1, 2, 2, 3], key=neg)
+        >>> cursor = skl.cursor()
+        >>> list(cursor.iterate())
+        [3, 2, 2, 1]
+        >>> list(cursor.iterate())
+        []
+        >>> cursor = skl.cursor(end=True)
+        >>> list(cursor.iterate(reverse=True))
+        [1, 2, 2, 3]
+
+        :param bool reverse: yield values before the cursor in reverse order
+        :return: iterator
+        :raises CursorInvalidError: if the cursor is invalid
+
+        """
+        skl = self._skl
+        start, stop = self._resolve()
+
+        if reverse:
+            iterator = skl.islice(0, stop, reverse=True)
+        else:
+            iterator = skl.islice(start, None)
+
+        return self._track(iterator)
+
+    def _track(self, iterator):
+        "Yield values from `iterator`, anchoring the cursor to each value."
+        key_fn = self._skl._key
+
+        for value in iterator:
+            self._state = _CURSOR_ANCHOR
+            self._value = value
+            self._key = key_fn(value)
+            yield value
+
+    def next(self):
+        """Return the value immediately after the cursor and advance.
+
+        Prefer :func:`iterate` when fetching more than a couple values; it
+        resolves the cursor position only once.
+
+        >>> from operator import neg
+        >>> skl = SortedKeyList([1, 2, 3], key=neg)
+        >>> cursor = skl.cursor()
+        >>> cursor.next()
+        3
+        >>> cursor.next()
+        2
+        >>> cursor.next()
+        1
+        >>> cursor.next()
+        Traceback (most recent call last):
+            ...
+        StopIteration
+
+        :return: value after the cursor
+        :raises StopIteration: if the cursor is at the end of the list
+        :raises CursorInvalidError: if the cursor is invalid
+
+        """
+        iterator = self.iterate()
+
+        try:
+            return next(iterator)
+        finally:
+            iterator.close()
+
+    def prev(self):
+        """Return the value immediately before the cursor and move back.
+
+        Prefer :func:`iterate` with `reverse` true when fetching more than
+        a couple values; it resolves the cursor position only once.
+
+        >>> from operator import neg
+        >>> skl = SortedKeyList([1, 2, 3], key=neg)
+        >>> cursor = skl.cursor(end=True)
+        >>> cursor.prev()
+        1
+        >>> cursor.prev()
+        2
+        >>> cursor.prev()
+        3
+        >>> cursor.prev()
+        Traceback (most recent call last):
+            ...
+        StopIteration
+
+        :return: value before the cursor
+        :raises StopIteration: if the cursor is at the start of the list
+        :raises CursorInvalidError: if the cursor is invalid
+
+        """
+        iterator = self.iterate(reverse=True)
+
+        try:
+            return next(iterator)
+        finally:
+            iterator.close()
+
+    def _resolve(self):
+        """Resolve the cursor to a pair of indices `(start, stop)`.
+
+        Forward iteration begins at index `start`; reverse iteration yields
+        the values before index `stop`.
+
+        """
+        state = self._state
+        skl = self._skl
+
+        if state == _CURSOR_START:
+            return 0, 0
+
+        if state == _CURSOR_END:
+            return skl._len, skl._len
+
+        value = self._value
+        key = skl._key(value)
+
+        if key != self._key:
+            raise CursorInvalidError('cursor anchor key changed')
+
+        index = _locate_value(skl, value, key)
+
+        if index is None:
+            raise CursorInvalidError(
+                'cursor anchor is no longer a member of the sorted-key list'
+            )
+
+        return index + 1, index
+
+    def __repr__(self):
+        """Return string representation of sorted-key list cursor.
+
+        ``sklc.__repr__()`` <==> ``repr(sklc)``
+
+        :return: string representation
+
+        """
+        type_name = type(self).__name__
+        state = self._state
+
+        if state == _CURSOR_ANCHOR:
+            return f'{type_name}(after={self._value!r})'
+
+        return f'{type_name}({state})'

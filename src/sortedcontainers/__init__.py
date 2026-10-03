@@ -51,12 +51,20 @@ from .sorteddict import (
     SortedKeysView,
     SortedValuesView,
 )
-from .sortedlist import SortedKeyList, SortedList, SortedListWithKey
+from .sortedlist import (
+    CursorInvalidError,
+    SortedKeyList,
+    SortedKeyListCursor,
+    SortedList,
+    SortedListWithKey,
+)
 from .sortedset import SortedSet
 
 __all__ = [
     'SortedList',
     'SortedKeyList',
+    'SortedKeyListCursor',
+    'CursorInvalidError',
     'SortedListWithKey',
     'SortedDict',
     'SortedKeysView',
